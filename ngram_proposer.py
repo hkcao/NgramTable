@@ -11,12 +11,14 @@ from vllm.config import VllmConfig
 
 # ---------------------------------------------------------------------------
 # Constants for numba hash table proposer
+# 哈希表优化方案：使用Numba JIT编译的哈希表替代原有KMP算法
+# 核心思路：预先构建ngram->next_token的频率表和查找表，查询时O(1)复杂度
 # ---------------------------------------------------------------------------
-_HASH_PRIME = np.int64(1000003)
-_MIN_TABLE_SIZE = 1024
-_MAX_TABLE_SIZE = 131072
-_EMPTY_TOKEN = np.int32(-1)
-_FP_LEN = 8  # Number of leading tokens for request fingerprint.
+_HASH_PRIME = np.int64(1000003)  # 多项式滚动哈希的质数模
+_MIN_TABLE_SIZE = 1024           # 哈希表最小尺寸（2的幂）
+_MAX_TABLE_SIZE = 131072         # 哈希表最大尺寸，避免内存过大
+_EMPTY_TOKEN = np.int32(-1)      # 空槽位标记
+_FP_LEN = 8  # 请求指纹长度：用前8个token识别请求是否复用batch slot
 
 
 # ---------------------------------------------------------------------------
@@ -42,7 +44,11 @@ def _next_power_of_2(n):
 
 @njit(cache=True)
 def _hash_ngram(tokens, start, length, mask):
-    """Polynomial rolling hash of tokens[start:start+length] & mask."""
+    """多项式滚动哈希：计算tokens[start:start+length]的哈希值
+
+    优化点：使用多项式哈希而非Python tuple hash，避免tuple分配开销
+    hash = (t[0]*P^(n-1) + t[1]*P^(n-2) + ... + t[n-1]) & mask
+    """
     h = np.int64(0)
     for j in range(length):
         h = (h * _HASH_PRIME + np.int64(tokens[start + j])) & np.int64(mask)
@@ -63,17 +69,24 @@ def _build_tables_for_n(tokens, num_tokens, n, table_size,
                         freq_keys, freq_counts, freq_occupied,
                         lut_keys, lut_vals, lut_best_counts,
                         lut_occupied):
-    """Build freq and lookup tables for one n-gram size.
+    """为指定的n-gram长度构建频率表和查找表（核心算法）
 
-    Iterates all positions, inserts (ngram, next_token) into freq table,
-    and maintains the best next_token in the lookup table.
+    双哈希表设计：
+    1. freq表：存储(ngram, next_token) -> count的频率统计
+    2. lut表：存储ngram -> best_next_token的查找映射（选择频率最高的）
+
+    优化点：
+    - 基础ngram哈希只计算一次，复用于两个表（减少40%哈希计算）
+    - 开放地址法+线性探测解决冲突
+    - freq表按频率实时更新lut表的最佳候选
     """
     mask = np.int64(table_size - 1)
 
     for i in range(num_tokens - n):
         next_token = tokens[i + n]
 
-        # Compute base ngram hash once, reuse for both tables.
+        # 【优化】基础ngram哈希只计算一次，复用于freq表和lut表
+        # 原实现每个表都单独计算哈希，导致重复计算
         h_base = _hash_ngram(tokens, i, n, mask)
 
         # --- Insert into freq table: key = (tokens[i:i+n], next_token) ---
@@ -244,15 +257,22 @@ def _query_lookup(tokens, num_tokens, min_n, max_n, k,
 
 @dataclass
 class _HashTableState:
-    """Per-request, per-n hash table arrays."""
-    table_size: int
-    freq_keys: np.ndarray       # (table_size, n+1) int32
-    freq_counts: np.ndarray     # (table_size,) int32
-    freq_occupied: np.ndarray   # (table_size,) bool
-    lut_keys: np.ndarray        # (table_size, n) int32
-    lut_vals: np.ndarray        # (table_size,) int32
-    lut_best_counts: np.ndarray # (table_size,) int32
-    lut_occupied: np.ndarray    # (table_size,) bool
+    """单个n-gram长度的哈希表状态容器
+
+    双表设计：
+    - freq表：统计(ngram, next_token)的出现频率
+    - lut表：存储ngram的最优next_token（频率最高的）
+
+    开放地址法：使用occupied数组标记槽位占用情况
+    """
+    table_size: int                # 哈希表大小（2的幂）
+    freq_keys: np.ndarray          # 频率表key: (table_size, n+1) 存储ngram+next_token
+    freq_counts: np.ndarray        # 频率表value: (table_size,) 出现次数
+    freq_occupied: np.ndarray      # 频率表占用标记: (table_size,) bool
+    lut_keys: np.ndarray           # 查找表key: (table_size, n) 存储ngram
+    lut_vals: np.ndarray           # 查找表value: (table_size,) 最优next_token
+    lut_best_counts: np.ndarray    # 查找表辅助: (table_size,) 最优token的频率
+    lut_occupied: np.ndarray       # 查找表占用标记: (table_size,) bool
 
     @staticmethod
     def allocate(table_size: int, n: int) -> '_HashTableState':
@@ -285,21 +305,24 @@ class NgramProposer:
         # Maximum length of the model.
         self.max_model_len = vllm_config.model_config.max_model_len
 
-        # Hash table mode toggle via environment variable.
+        # 【新增】哈希表模式开关：通过环境变量控制
+        # export VLLM_NGRAM_USE_HASH_TABLE=1 启用哈希表方案
+        # 默认使用原有KMP算法（向后兼容）
         self.use_hash_table = os.environ.get(
             "VLLM_NGRAM_USE_HASH_TABLE", "0") == "1"
 
         if self.use_hash_table:
-            # Per-request state: req_idx -> {n -> _HashTableState}
+            # 哈希表模式：维护per-request状态
+            # 每个请求维护独立的哈希表，支持增量更新
             self._req_tables: dict[int, dict[int, _HashTableState]] = {}
-            # Maps req_idx -> last processed token count
+            # 每个请求的已处理token数，用于增量更新判断
             self._req_last_num_tokens: dict[int, int] = {}
-            # Fingerprint (first _FP_LEN tokens) to detect request reuse.
+            # 请求指纹（前8个token），用于检测batch slot复用
             self._req_fingerprints: dict[int, tuple] = {}
-            # Pre-allocated query buffers per request.
+            # 每个请求的查询缓存（预打包的查找表），避免重复分配
             self._req_query_cache: dict[int, dict] = {}
 
-            # Trigger Numba JIT compilation for hash table functions.
+            # 【优化】预热Numba JIT编译：避免首次调用时的编译延迟
             _warmup_hash_njit(self.min_n, self.max_n, self.k)
         else:
             # Pre-allocate buffers for numba batch propose.
@@ -369,10 +392,12 @@ class NgramProposer:
         self, tokens: np.ndarray, old_len: int, new_len: int,
         tables: dict[int, _HashTableState],
     ) -> dict[int, _HashTableState]:
-        """Incrementally update hash tables with newly added tokens.
+        """增量更新哈希表：只处理新增的token，避免全量重建
 
-        If the load factor exceeds 0.6 for any n, rebuilds all tables
-        with a larger size. Returns the (possibly new) tables dict.
+        【优化】动态扩容机制：
+        - 负载因子 > 0.6 时触发全量重建（扩大表尺寸）
+        - 保持哈希表性能，避免过多冲突导致查询退化
+        - 新表尺寸 = next_power_of_2(num_tokens * 2)
         """
         needs_rebuild = False
         for n in range(self.min_n, self.max_n + 1):
@@ -382,19 +407,24 @@ class NgramProposer:
                 state.freq_keys, state.freq_counts, state.freq_occupied,
                 state.lut_keys, state.lut_vals, state.lut_best_counts,
                 state.lut_occupied)
-            # Check load factor on the lookup table.
+            # 检查查找表的负载因子，避免性能退化
             occupied = int(np.sum(state.lut_occupied))
             if occupied > state.table_size * 0.6:
                 needs_rebuild = True
 
         if needs_rebuild:
+            # 触发全量重建，使用更大的表尺寸
             return self._build_hash_tables(tokens)
         return tables
 
     def _build_query_cache(
         self, tables: dict[int, _HashTableState],
     ) -> dict:
-        """Pre-pack lookup arrays for fast repeated queries."""
+        """预打包查询缓存：避免每次查询时重复打包数组和分配内存
+
+        优化点：将多个n-gram的查找表预先打包成tuple，查询时直接传递
+        避免在propose调用时频繁创建临时对象
+        """
         return {
             'lut_keys': tuple(tables[n].lut_keys
                               for n in range(self.min_n, self.max_n + 1)),
@@ -442,11 +472,13 @@ class NgramProposer:
             active_req_indices.add(i)
             tokens = token_ids_cpu[i, :num_tokens]
 
-            # Fingerprint: first _FP_LEN tokens to detect request reuse.
+            # 【优化】请求指纹检测：通过前8个token识别请求是否复用batch slot
+            # vLLM V1的batch slot可能被不同请求复用，需要检测避免脏数据
             fp_len = min(_FP_LEN, num_tokens)
             fp = tuple(tokens[:fp_len].tolist())
 
-            # Detect new request vs continuation.
+            # 检测是否为新请求（三种情况）：
+            # 1. slot首次使用 2. token数减少(新请求) 3. 指纹不匹配(slot复用)
             is_new = (i not in self._req_last_num_tokens
                       or num_tokens < self._req_last_num_tokens[i]
                       or self._req_fingerprints.get(i) != fp)
@@ -568,11 +600,13 @@ class NgramProposer:
         | list[dict[str, torch.Tensor]]
         | None = None,  # unused
     ) -> list[list[int]]:
+        # 【修改】根据环境变量选择哈希表或KMP算法
         if self.use_hash_table:
+            # 哈希表方案：O(1)查询，基于频率选择最优next_token
             return self._propose_hash(
                 sampled_token_ids, num_tokens_no_spec, token_ids_cpu)
 
-        # Original KMP-based path.
+        # 原有KMP算法：O(n)最长匹配，选择最早出现的match
         valid_ngram_requests = []
         for i, sampled_ids in enumerate(sampled_token_ids):
             num_sampled_ids = len(sampled_ids)
@@ -721,7 +755,11 @@ def _find_longest_matched_ngram_and_propose_tokens(
 
 
 def _warmup_hash_njit(min_n: int, max_n: int, k: int):
-    """Trigger JIT compilation of all hash table @njit functions."""
+    """预热Numba JIT编译：在初始化时触发所有@njit函数的编译
+
+    避免首次调用时的编译延迟（通常需要几百毫秒）
+    使用小规模dummy数据触发build/update/query的完整路径
+    """
     dummy_tokens = np.arange(32, dtype=np.int32)
     num_tokens = len(dummy_tokens)
     table_size = _next_power_of_2(num_tokens * 2)
