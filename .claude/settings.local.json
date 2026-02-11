@@ -1,0 +1,38 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(python3:*)",
+      "Bash(pip3 install:*)",
+      "Bash(curl:*)",
+      "Bash(sudo apt update:*)",
+      "Bash(sudo apt install:*)",
+      "Bash(tee:*)",
+      "Bash(sudo pip3 install:*)",
+      "Bash(source:*)",
+      "Bash(pip install:*)",
+      "Bash(wait:*)",
+      "Bash(while ps:*)",
+      "Bash(do sleep 10)",
+      "Bash(done)",
+      "Bash(for:*)",
+      "Bash(do sleep 20)",
+      "Bash(break)",
+      "Bash(echo:*)",
+      "Bash(lsof:*)",
+      "Bash(nvidia-smi:*)",
+      "Bash(/home/hank/Agent/ngramTable/venv/bin/python:*)",
+      "Bash(find:*)",
+      "Bash(./venv/bin/python:*)",
+      "Bash(ls:*)",
+      "Bash(kill:*)",
+      "Bash(xargs kill:*)",
+      "Bash(pkill:*)",
+      "Bash(git init:*)",
+      "Bash(git remote add:*)",
+      "Bash(git checkout:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
+    ]
+  }
+}

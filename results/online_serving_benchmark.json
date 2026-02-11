@@ -1,0 +1,97 @@
+{
+  "meta": {
+    "date": "2026-02-08",
+    "vllm_version": "0.15.1",
+    "model": "Qwen/Qwen2.5-0.5B-Instruct",
+    "gpu": "RTX 4070 Super 16GB",
+    "num_samples": 10,
+    "max_tokens": 512,
+    "mode": "sequential single-user streaming"
+  },
+  "results": [
+    {
+      "mode": "baseline (无投机)",
+      "num_requests": 10,
+      "avg_ttft_s": 0.0143,
+      "p50_ttft_s": 0.0144,
+      "p99_ttft_s": 0.0176,
+      "avg_latency_s": 1.1722,
+      "p50_latency_s": 1.2971,
+      "p99_latency_s": 1.3005,
+      "avg_output_tokens": 461.0,
+      "avg_tok_s": 393.02,
+      "total_time_s": 11.72,
+      "spec_config": null,
+      "acceptance_stats": null
+    },
+    {
+      "mode": "ngram spec=5 lookup=2-5",
+      "num_requests": 10,
+      "avg_ttft_s": 0.0153,
+      "p50_ttft_s": 0.0165,
+      "p99_ttft_s": 0.0192,
+      "avg_latency_s": 1.066,
+      "p50_latency_s": 1.0527,
+      "p99_latency_s": 2.0496,
+      "avg_output_tokens": 253.4,
+      "avg_tok_s": 239.97,
+      "total_time_s": 10.66,
+      "spec_config": {
+        "method": "ngram",
+        "num_speculative_tokens": 5,
+        "prompt_lookup_max": 5,
+        "prompt_lookup_min": 2
+      },
+      "acceptance_stats": {
+        "num_drafts": 791,
+        "num_draft_tokens": 3944,
+        "num_accepted_tokens": 1972,
+        "acceptance_rate_pct": 50.0,
+        "mean_accepted_length": 3.49,
+        "per_position_acceptance": [
+          0.669,
+          0.556,
+          0.484,
+          0.44,
+          0.344
+        ]
+      }
+    },
+    {
+      "mode": "ngram spec=8 lookup=3-7",
+      "num_requests": 10,
+      "avg_ttft_s": 0.0163,
+      "p50_ttft_s": 0.0168,
+      "p99_ttft_s": 0.0217,
+      "avg_latency_s": 1.2314,
+      "p50_latency_s": 1.1984,
+      "p99_latency_s": 1.8815,
+      "avg_output_tokens": 287.9,
+      "avg_tok_s": 229.99,
+      "total_time_s": 12.32,
+      "spec_config": {
+        "method": "ngram",
+        "num_speculative_tokens": 8,
+        "prompt_lookup_max": 7,
+        "prompt_lookup_min": 3
+      },
+      "acceptance_stats": {
+        "num_drafts": 573,
+        "num_draft_tokens": 4539,
+        "num_accepted_tokens": 2185,
+        "acceptance_rate_pct": 48.14,
+        "mean_accepted_length": 4.81,
+        "per_position_acceptance": [
+          0.7,
+          0.586,
+          0.541,
+          0.464,
+          0.415,
+          0.389,
+          0.377,
+          0.34
+        ]
+      }
+    }
+  ]
+}

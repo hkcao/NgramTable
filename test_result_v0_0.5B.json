@@ -1,0 +1,95 @@
+{
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "num_samples": 20,
+  "max_tokens": 512,
+  "gpu_memory_utilization": 0.85,
+  "date": "2026-02-10",
+  "implementation": "Phase 2 numba hash table",
+  "results": [
+    {
+      "mode": "baseline",
+      "tokens_per_second": 6412.21,
+      "elapsed_time": 1.552,
+      "total_input_tokens": 9966,
+      "total_output_tokens": 9952
+    },
+    {
+      "mode": "KMP spec=3 n=2-3",
+      "tokens_per_second": 5363.81,
+      "elapsed_time": 1.855,
+      "acceptance_stats": {
+        "num_drafts": 2813,
+        "num_draft_tokens": 8436,
+        "num_accepted_tokens": 5731,
+        "acceptance_rate_pct": 67.93,
+        "mean_accepted_length": 3.04,
+        "per_position_acceptance": [0.774, 0.675, 0.588]
+      }
+    },
+    {
+      "mode": "HashTable spec=3 n=2-3",
+      "tokens_per_second": 5055.05,
+      "elapsed_time": 1.969,
+      "acceptance_stats": {
+        "num_drafts": 2578,
+        "num_draft_tokens": 7734,
+        "num_accepted_tokens": 5911,
+        "acceptance_rate_pct": 76.43,
+        "mean_accepted_length": 3.29,
+        "per_position_acceptance": [0.843, 0.760, 0.690]
+      }
+    },
+    {
+      "mode": "KMP spec=5 n=2-5",
+      "tokens_per_second": 6180.68,
+      "elapsed_time": 1.592,
+      "acceptance_stats": {
+        "num_drafts": 1932,
+        "num_draft_tokens": 9640,
+        "num_accepted_tokens": 6610,
+        "acceptance_rate_pct": 68.57,
+        "mean_accepted_length": 4.42,
+        "per_position_acceptance": [0.805, 0.725, 0.668, 0.625, 0.598]
+      }
+    },
+    {
+      "mode": "HashTable spec=5 n=2-5",
+      "tokens_per_second": 6534.29,
+      "elapsed_time": 1.567,
+      "acceptance_stats": {
+        "num_drafts": 1877,
+        "num_draft_tokens": 9385,
+        "num_accepted_tokens": 6864,
+        "acceptance_rate_pct": 73.14,
+        "mean_accepted_length": 4.66,
+        "per_position_acceptance": [0.854, 0.774, 0.714, 0.673, 0.641]
+      }
+    },
+    {
+      "mode": "KMP spec=8 n=3-7",
+      "tokens_per_second": 5183.89,
+      "elapsed_time": 1.898,
+      "acceptance_stats": {
+        "num_drafts": 1305,
+        "num_draft_tokens": 10350,
+        "num_accepted_tokens": 6752,
+        "acceptance_rate_pct": 65.24,
+        "mean_accepted_length": 6.17,
+        "per_position_acceptance": [0.837, 0.728, 0.661, 0.631, 0.602, 0.582, 0.572, 0.561]
+      }
+    },
+    {
+      "mode": "HashTable spec=8 n=3-7",
+      "tokens_per_second": 6766.01,
+      "elapsed_time": 1.513,
+      "acceptance_stats": {
+        "num_drafts": 1267,
+        "num_draft_tokens": 10136,
+        "num_accepted_tokens": 7362,
+        "acceptance_rate_pct": 72.64,
+        "mean_accepted_length": 6.81,
+        "per_position_acceptance": [0.888, 0.796, 0.752, 0.723, 0.693, 0.667, 0.655, 0.637]
+      }
+    }
+  ]
+}
