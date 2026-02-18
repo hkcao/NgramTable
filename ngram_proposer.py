@@ -1,13 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import atexit
+import json
+import logging
 import os
+import threading
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 import torch
 from numba import get_num_threads, jit, njit, prange, set_num_threads
 
 from vllm.config import VllmConfig
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants for numba hash table proposer
@@ -19,6 +27,11 @@ _MIN_TABLE_SIZE = 1024           # 哈希表最小尺寸（2的幂）
 _MAX_TABLE_SIZE = 131072         # 哈希表最大尺寸，避免内存过大
 _EMPTY_TOKEN = np.int32(-1)      # 空槽位标记
 _FP_LEN = 8  # 请求指纹长度：用前8个token识别请求是否复用batch slot
+
+# Shared mode constants
+_SHARED_DEFAULT_TABLE_SIZE = 1048576   # 1M slots default for shared tables
+_SHARED_MAX_TABLE_SIZE = 8388608       # 8M slots hard cap
+_SHARED_METADATA_VERSION = 1           # File format version
 
 
 # ---------------------------------------------------------------------------
@@ -39,6 +52,27 @@ def _next_power_of_2(n):
     v += 1
     if v > _MAX_TABLE_SIZE:
         return _MAX_TABLE_SIZE
+    return v
+
+
+def _next_power_of_2_shared(n: int) -> int:
+    """Round up to next power of 2 for shared tables.
+
+    Clamped to [_MIN_TABLE_SIZE, _SHARED_MAX_TABLE_SIZE].
+    Not a Numba function — only called at init/load time.
+    """
+    if n <= _MIN_TABLE_SIZE:
+        return _MIN_TABLE_SIZE
+    v = n - 1
+    v |= v >> 1
+    v |= v >> 2
+    v |= v >> 4
+    v |= v >> 8
+    v |= v >> 16
+    v |= v >> 32
+    v += 1
+    if v > _SHARED_MAX_TABLE_SIZE:
+        return _SHARED_MAX_TABLE_SIZE
     return v
 
 
@@ -288,6 +322,258 @@ class _HashTableState:
         )
 
 
+@dataclass
+class _SharedHashTableState:
+    """Shared hash table state for one n-gram size, with dirty tracking.
+
+    Extends _HashTableState conceptually with:
+    - dirty flag to track unsaved modifications
+    - occupied_count for O(1) load factor monitoring
+    """
+    table_size: int
+    freq_keys: np.ndarray
+    freq_counts: np.ndarray
+    freq_occupied: np.ndarray
+    lut_keys: np.ndarray
+    lut_vals: np.ndarray
+    lut_best_counts: np.ndarray
+    lut_occupied: np.ndarray
+    dirty: bool = False
+    occupied_count: int = 0
+
+    @staticmethod
+    def allocate(table_size: int, n: int) -> '_SharedHashTableState':
+        return _SharedHashTableState(
+            table_size=table_size,
+            freq_keys=np.zeros((table_size, n + 1), dtype=np.int32),
+            freq_counts=np.zeros(table_size, dtype=np.int32),
+            freq_occupied=np.zeros(table_size, dtype=np.bool_),
+            lut_keys=np.zeros((table_size, n), dtype=np.int32),
+            lut_vals=np.full(table_size, _EMPTY_TOKEN, dtype=np.int32),
+            lut_best_counts=np.zeros(table_size, dtype=np.int32),
+            lut_occupied=np.zeros(table_size, dtype=np.bool_),
+            dirty=False,
+            occupied_count=0,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Shared table persistence: load / save / flush
+# ---------------------------------------------------------------------------
+
+def _load_shared_tables(
+    shared_dir: Path, min_n: int, max_n: int, table_size: int,
+) -> dict[int, _SharedHashTableState]:
+    """Load shared tables from disk, or allocate empty ones if unavailable."""
+    tables: dict[int, _SharedHashTableState] = {}
+    meta_path = shared_dir / "metadata.json"
+
+    if not shared_dir.exists():
+        shared_dir.mkdir(parents=True, exist_ok=True)
+        logger.info("Shared ngram dir created: %s", shared_dir)
+        for n in range(min_n, max_n + 1):
+            tables[n] = _SharedHashTableState.allocate(table_size, n)
+        return tables
+
+    # Try loading metadata
+    if not meta_path.exists():
+        logger.warning("No metadata.json in %s, allocating empty tables",
+                       shared_dir)
+        for n in range(min_n, max_n + 1):
+            tables[n] = _SharedHashTableState.allocate(table_size, n)
+        return tables
+
+    try:
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("Failed to read metadata.json: %s, allocating empty "
+                       "tables", e)
+        for n in range(min_n, max_n + 1):
+            tables[n] = _SharedHashTableState.allocate(table_size, n)
+        return tables
+
+    # Version / parameter mismatch check
+    if (meta.get("version") != _SHARED_METADATA_VERSION
+            or meta.get("min_n") != min_n
+            or meta.get("max_n") != max_n
+            or meta.get("table_size") != table_size):
+        logger.warning(
+            "Metadata mismatch (version=%s, min_n=%s, max_n=%s, "
+            "table_size=%s vs expected %s/%s/%s/%s). Allocating empty tables.",
+            meta.get("version"), meta.get("min_n"), meta.get("max_n"),
+            meta.get("table_size"),
+            _SHARED_METADATA_VERSION, min_n, max_n, table_size)
+        for n in range(min_n, max_n + 1):
+            tables[n] = _SharedHashTableState.allocate(table_size, n)
+        return tables
+
+    # Load each n-gram file
+    for n in range(min_n, max_n + 1):
+        npz_path = shared_dir / f"n{n}.npz"
+        if not npz_path.exists():
+            logger.warning("Missing %s, allocating empty table for n=%d",
+                           npz_path, n)
+            tables[n] = _SharedHashTableState.allocate(table_size, n)
+            continue
+        try:
+            data = np.load(npz_path)
+            occupied_count = int(np.sum(data["lut_occupied"]))
+            tables[n] = _SharedHashTableState(
+                table_size=table_size,
+                freq_keys=data["freq_keys"],
+                freq_counts=data["freq_counts"],
+                freq_occupied=data["freq_occupied"],
+                lut_keys=data["lut_keys"],
+                lut_vals=data["lut_vals"],
+                lut_best_counts=data["lut_best_counts"],
+                lut_occupied=data["lut_occupied"],
+                dirty=False,
+                occupied_count=occupied_count,
+            )
+            logger.info("Loaded shared table n=%d from %s "
+                        "(occupied=%d/%d, load=%.1f%%)",
+                        n, npz_path, occupied_count, table_size,
+                        100.0 * occupied_count / table_size)
+        except Exception as e:
+            logger.warning("Failed to load %s: %s, allocating empty table",
+                           npz_path, e)
+            tables[n] = _SharedHashTableState.allocate(table_size, n)
+
+    return tables
+
+
+def _save_shared_tables_sync(
+    shared_dir: Path, min_n: int, max_n: int, table_size: int,
+    tables: dict[int, _SharedHashTableState],
+) -> None:
+    """Save shared tables to disk atomically (write .tmp then rename)."""
+    shared_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save metadata
+    meta = {
+        "version": _SHARED_METADATA_VERSION,
+        "min_n": min_n,
+        "max_n": max_n,
+        "table_size": table_size,
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+    }
+    meta_tmp = shared_dir / "metadata.json.tmp"
+    meta_path = shared_dir / "metadata.json"
+    with open(meta_tmp, "w") as f:
+        json.dump(meta, f, indent=2)
+    meta_tmp.rename(meta_path)
+
+    # Save each n-gram table
+    for n, state in tables.items():
+        npz_tmp = shared_dir / f"n{n}.npz.tmp"
+        npz_path = shared_dir / f"n{n}.npz"
+        np.savez_compressed(
+            npz_tmp,
+            freq_keys=state.freq_keys,
+            freq_counts=state.freq_counts,
+            freq_occupied=state.freq_occupied,
+            lut_keys=state.lut_keys,
+            lut_vals=state.lut_vals,
+            lut_best_counts=state.lut_best_counts,
+            lut_occupied=state.lut_occupied,
+        )
+        npz_tmp.rename(npz_path)
+        state.dirty = False
+
+
+class _SharedTableFlusher:
+    """Background daemon thread that periodically flushes shared tables."""
+
+    def __init__(
+        self,
+        shared_dir: Path,
+        min_n: int,
+        max_n: int,
+        table_size: int,
+        tables: dict[int, _SharedHashTableState],
+        lock: threading.Lock,
+        flush_interval: float = 60.0,
+    ):
+        self._shared_dir = shared_dir
+        self._min_n = min_n
+        self._max_n = max_n
+        self._table_size = table_size
+        self._tables = tables
+        self._lock = lock
+        self._flush_interval = flush_interval
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="ngram-shared-flusher")
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(self._flush_interval):
+            self.flush()
+
+    def flush(self) -> None:
+        """Flush dirty tables to disk. Safe to call from any thread."""
+        # Check if any table is dirty
+        any_dirty = False
+        with self._lock:
+            for state in self._tables.values():
+                if state.dirty:
+                    any_dirty = True
+                    break
+
+        if not any_dirty:
+            return
+
+        # Copy arrays under lock (fast, microsecond-level)
+        copies: dict[int, dict[str, np.ndarray]] = {}
+        with self._lock:
+            for n, state in self._tables.items():
+                if state.dirty:
+                    copies[n] = {
+                        "freq_keys": state.freq_keys.copy(),
+                        "freq_counts": state.freq_counts.copy(),
+                        "freq_occupied": state.freq_occupied.copy(),
+                        "lut_keys": state.lut_keys.copy(),
+                        "lut_vals": state.lut_vals.copy(),
+                        "lut_best_counts": state.lut_best_counts.copy(),
+                        "lut_occupied": state.lut_occupied.copy(),
+                    }
+                    state.dirty = False
+
+        # Write to disk outside the lock (slow I/O)
+        try:
+            self._shared_dir.mkdir(parents=True, exist_ok=True)
+
+            # Save metadata
+            meta = {
+                "version": _SHARED_METADATA_VERSION,
+                "min_n": self._min_n,
+                "max_n": self._max_n,
+                "table_size": self._table_size,
+                "saved_at": datetime.now(timezone.utc).isoformat(),
+            }
+            meta_tmp = self._shared_dir / "metadata.json.tmp"
+            meta_path = self._shared_dir / "metadata.json"
+            with open(meta_tmp, "w") as f:
+                json.dump(meta, f, indent=2)
+            meta_tmp.rename(meta_path)
+
+            for n, arrays in copies.items():
+                npz_tmp = self._shared_dir / f"n{n}.npz.tmp"
+                npz_path = self._shared_dir / f"n{n}.npz"
+                np.savez_compressed(npz_tmp, **arrays)
+                npz_tmp.rename(npz_path)
+
+            logger.info("Shared ngram tables flushed to %s", self._shared_dir)
+        except Exception:
+            logger.warning("Failed to flush shared ngram tables",
+                           exc_info=True)
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._thread.join(timeout=5.0)
+
+
 class NgramProposer:
     def __init__(self, vllm_config: VllmConfig):
         assert vllm_config.speculative_config is not None
@@ -305,62 +591,105 @@ class NgramProposer:
         # Maximum length of the model.
         self.max_model_len = vllm_config.model_config.max_model_len
 
-        # 【新增】哈希表模式开关：通过环境变量控制
-        # export VLLM_NGRAM_USE_HASH_TABLE=1 启用哈希表方案
-        # 默认使用原有KMP算法（向后兼容）
-        self.use_hash_table = os.environ.get(
-            "VLLM_NGRAM_USE_HASH_TABLE", "0") == "1"
-
-        if self.use_hash_table:
-            # 哈希表模式：维护per-request状态
-            # 每个请求维护独立的哈希表，支持增量更新
-            self._req_tables: dict[int, dict[int, _HashTableState]] = {}
-            # 每个请求的已处理token数，用于增量更新判断
-            self._req_last_num_tokens: dict[int, int] = {}
-            # 请求指纹（前8个token），用于检测batch slot复用
-            self._req_fingerprints: dict[int, tuple] = {}
-            # 每个请求的查询缓存（预打包的查找表），避免重复分配
-            self._req_query_cache: dict[int, dict] = {}
-
-            # 【优化】预热Numba JIT编译：避免首次调用时的编译延迟
-            _warmup_hash_njit(self.min_n, self.max_n, self.k)
-        else:
-            # Pre-allocate buffers for numba batch propose.
-            max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-            self.valid_ngram_draft = np.zeros(
-                (max_num_seqs, self.k), dtype=np.int32)
-            self.valid_ngram_num_drafts = np.zeros(
-                (max_num_seqs), dtype=np.int32)
-
-            # Threshold of total number of tokens in the batch to enable
-            # multi-threading in numba batch propose.
-            self.num_tokens_threshold = 8192
-            tp_size = vllm_config.parallel_config.tensor_parallel_size
-            cpu_count = os.cpu_count()
-            # Max number of threads for numba parallel processing.
-            if cpu_count:
-                # Divide by 2 to use physical cores
-                # and not logical cores (hyper-threading).
-                # Cap the number of threads to 8 to avoid using too many
-                # threads since other components like frontend (incl
-                # tokenization) and Structured Outputs also use multiple
-                # threads.
-                # TODO(ekagra-ranjan): bump up the cap from 1 to 8
-                # when TP parallelization for ngram is implemented.
-                self.num_numba_thread_available = min(1, (cpu_count // 2))
-                # Divide by tp_size to ensure each tensor parallel rank
-                # has some threads since all ranks will run this.
-                self.num_numba_thread_available //= tp_size
+        # 三路模式选择：kmp | per_request | shared
+        # VLLM_NGRAM_MODE 优先；未设置时回退检查 VLLM_NGRAM_USE_HASH_TABLE
+        ngram_mode = os.environ.get("VLLM_NGRAM_MODE", "").lower()
+        if ngram_mode not in ("kmp", "per_request", "shared"):
+            # Backward compat: fall back to old env var
+            if os.environ.get("VLLM_NGRAM_USE_HASH_TABLE", "0") == "1":
+                ngram_mode = "per_request"
             else:
-                self.num_numba_thread_available = 1
+                ngram_mode = "kmp"
+        self.ngram_mode = ngram_mode
 
-            # Trigger Numba JIT compilation for N-gram proposer.
-            # This usually takes less than 1 second.
-            self.propose(
-                [[]] * 1024,
-                np.zeros(1024, dtype=np.int32),
-                np.zeros((1024, self.max_model_len), dtype=np.int32),
-            )
+        if self.ngram_mode == "shared":
+            self._init_shared_mode()
+        elif self.ngram_mode == "per_request":
+            self._init_per_request_mode()
+        else:
+            self._init_kmp_mode(vllm_config)
+
+    def _init_per_request_mode(self) -> None:
+        """Initialize per-request hash table mode."""
+        # 每个请求维护独立的哈希表，支持增量更新
+        self._req_tables: dict[int, dict[int, _HashTableState]] = {}
+        self._req_last_num_tokens: dict[int, int] = {}
+        self._req_fingerprints: dict[int, tuple] = {}
+        self._req_query_cache: dict[int, dict] = {}
+        _warmup_hash_njit(self.min_n, self.max_n, self.k)
+
+    def _init_shared_mode(self) -> None:
+        """Initialize shared persistent hash table mode."""
+        table_size_raw = int(os.environ.get(
+            "VLLM_NGRAM_SHARED_TABLE_SIZE",
+            str(_SHARED_DEFAULT_TABLE_SIZE)))
+        self._shared_table_size = _next_power_of_2_shared(table_size_raw)
+
+        shared_dir_name = os.environ.get(
+            "VLLM_NGRAM_SHARED_DIR", "ngram_hash")
+        self._shared_dir = Path(shared_dir_name)
+
+        flush_interval = float(os.environ.get(
+            "VLLM_NGRAM_FLUSH_INTERVAL", "60"))
+
+        # Load or allocate tables
+        self._shared_tables = _load_shared_tables(
+            self._shared_dir, self.min_n, self.max_n,
+            self._shared_table_size)
+
+        # Lock protects shared table arrays during updates
+        self._shared_lock = threading.Lock()
+
+        # Per-request tracking: slot -> (last_num_tokens, fingerprint)
+        self._shared_req_state: dict[int, tuple[int, tuple]] = {}
+
+        # Pre-build query cache (references into shared tables)
+        self._shared_query_cache = self._build_query_cache_shared()
+
+        # Background flusher
+        self._shared_flusher = _SharedTableFlusher(
+            self._shared_dir, self.min_n, self.max_n,
+            self._shared_table_size, self._shared_tables,
+            self._shared_lock, flush_interval)
+
+        # Register atexit handler for clean shutdown
+        atexit.register(self._shutdown_shared)
+
+        # Warmup Numba JIT
+        _warmup_hash_njit(self.min_n, self.max_n, self.k)
+
+        logger.info(
+            "NgramProposer shared mode: table_size=%d, dir=%s, "
+            "flush_interval=%.0fs",
+            self._shared_table_size, self._shared_dir, flush_interval)
+
+    def _init_kmp_mode(self, vllm_config: VllmConfig) -> None:
+        """Initialize original KMP mode."""
+        # Pre-allocate buffers for numba batch propose.
+        max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+        self.valid_ngram_draft = np.zeros(
+            (max_num_seqs, self.k), dtype=np.int32)
+        self.valid_ngram_num_drafts = np.zeros(
+            (max_num_seqs), dtype=np.int32)
+
+        # Threshold of total number of tokens in the batch to enable
+        # multi-threading in numba batch propose.
+        self.num_tokens_threshold = 8192
+        tp_size = vllm_config.parallel_config.tensor_parallel_size
+        cpu_count = os.cpu_count()
+        # Max number of threads for numba parallel processing.
+        if cpu_count:
+            self.num_numba_thread_available = min(1, (cpu_count // 2))
+            self.num_numba_thread_available //= tp_size
+        else:
+            self.num_numba_thread_available = 1
+
+        # Trigger Numba JIT compilation for N-gram proposer.
+        self.propose(
+            [[]] * 1024,
+            np.zeros(1024, dtype=np.int32),
+            np.zeros((1024, self.max_model_len), dtype=np.int32),
+        )
 
     def _build_hash_tables(
         self, tokens: np.ndarray
@@ -523,6 +852,123 @@ class NgramProposer:
 
         return draft_token_ids
 
+    # ------------------------------------------------------------------
+    # Shared mode helpers
+    # ------------------------------------------------------------------
+
+    def _build_query_cache_shared(self) -> dict:
+        """Build query cache referencing the shared tables (no copy)."""
+        tables = self._shared_tables
+        return {
+            'lut_keys': tuple(tables[n].lut_keys
+                              for n in range(self.min_n, self.max_n + 1)),
+            'lut_vals': tuple(tables[n].lut_vals
+                              for n in range(self.min_n, self.max_n + 1)),
+            'lut_occupied': tuple(
+                tables[n].lut_occupied
+                for n in range(self.min_n, self.max_n + 1)),
+            'table_sizes': np.array(
+                [tables[n].table_size
+                 for n in range(self.min_n, self.max_n + 1)],
+                dtype=np.int64),
+            'draft_out': np.empty(self.k, dtype=np.int32),
+        }
+
+    def _propose_shared(
+        self,
+        sampled_token_ids: list[list[int]],
+        num_tokens_no_spec: np.ndarray,
+        token_ids_cpu: np.ndarray,
+    ) -> list[list[int]]:
+        """Shared-table ngram proposal: all requests update global tables."""
+        draft_token_ids: list[list[int]] = []
+        active_req_indices: set[int] = set()
+
+        for i, sampled_ids in enumerate(sampled_token_ids):
+            if not len(sampled_ids):
+                draft_token_ids.append([])
+                continue
+
+            num_tokens = int(num_tokens_no_spec[i])
+            if num_tokens >= self.max_model_len:
+                draft_token_ids.append([])
+                continue
+
+            active_req_indices.add(i)
+            tokens = token_ids_cpu[i, :num_tokens]
+
+            # Fingerprint for request identity detection
+            fp_len = min(_FP_LEN, num_tokens)
+            fp = tuple(tokens[:fp_len].tolist())
+
+            # Determine old_len for incremental update
+            prev = self._shared_req_state.get(i)
+            if prev is None or num_tokens < prev[0] or prev[1] != fp:
+                # New request: full insert
+                old_len = 0
+            else:
+                old_len = prev[0]
+
+            # Update shared tables with this request's tokens
+            if num_tokens > old_len:
+                with self._shared_lock:
+                    for n in range(self.min_n, self.max_n + 1):
+                        state = self._shared_tables[n]
+                        _update_tables_for_n(
+                            tokens, old_len, num_tokens, n,
+                            state.table_size,
+                            state.freq_keys, state.freq_counts,
+                            state.freq_occupied,
+                            state.lut_keys, state.lut_vals,
+                            state.lut_best_counts, state.lut_occupied)
+                        new_occupied = int(np.sum(state.lut_occupied))
+                        state.occupied_count = new_occupied
+                        state.dirty = True
+
+                        # Load factor warning
+                        load_factor = new_occupied / state.table_size
+                        if load_factor > 0.8:
+                            logger.warning(
+                                "Shared table n=%d load factor %.1f%% "
+                                "(%d/%d). Consider increasing "
+                                "VLLM_NGRAM_SHARED_TABLE_SIZE.",
+                                n, 100.0 * load_factor,
+                                new_occupied, state.table_size)
+
+            self._shared_req_state[i] = (num_tokens, fp)
+
+            # Query for draft tokens
+            k = min(self.k, self.max_model_len - num_tokens)
+            if k <= 0:
+                draft_token_ids.append([])
+                continue
+
+            qc = self._shared_query_cache
+            draft_out = qc['draft_out']
+            num_drafted = _query_lookup(
+                tokens, num_tokens, self.min_n, self.max_n, k,
+                qc['lut_keys'], qc['lut_vals'], qc['lut_occupied'],
+                qc['table_sizes'], draft_out)
+            draft_token_ids.append(draft_out[:num_drafted].tolist())
+
+        # Cleanup stale request tracking
+        stale = set(self._shared_req_state.keys()) - active_req_indices
+        for idx in stale:
+            del self._shared_req_state[idx]
+
+        return draft_token_ids
+
+    def _shutdown_shared(self) -> None:
+        """Clean shutdown: stop flusher and do a final sync flush."""
+        if hasattr(self, '_shared_flusher'):
+            self._shared_flusher.stop()
+            # Final synchronous flush
+            try:
+                self._shared_flusher.flush()
+            except Exception:
+                logger.warning("Final shared table flush failed",
+                               exc_info=True)
+
     def batch_propose(
         self,
         num_requests: int,
@@ -600,13 +1046,15 @@ class NgramProposer:
         | list[dict[str, torch.Tensor]]
         | None = None,  # unused
     ) -> list[list[int]]:
-        # 【修改】根据环境变量选择哈希表或KMP算法
-        if self.use_hash_table:
-            # 哈希表方案：O(1)查询，基于频率选择最优next_token
+        if self.ngram_mode == "shared":
+            return self._propose_shared(
+                sampled_token_ids, num_tokens_no_spec, token_ids_cpu)
+
+        if self.ngram_mode == "per_request":
             return self._propose_hash(
                 sampled_token_ids, num_tokens_no_spec, token_ids_cpu)
 
-        # 原有KMP算法：O(n)最长匹配，选择最早出现的match
+        # KMP mode
         valid_ngram_requests = []
         for i, sampled_ids in enumerate(sampled_token_ids):
             num_sampled_ids = len(sampled_ids)
