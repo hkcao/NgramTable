@@ -1,0 +1,8 @@
+# Transformer-based speculative decoding — macOS compatible
+# No vLLM dependency
+
+torch>=2.1.0
+transformers>=4.40.0
+datasets>=2.14.0
+numpy>=1.24.0
+accelerate>=0.27.0
