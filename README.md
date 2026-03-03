@@ -1,109 +1,136 @@
-# NgramTable — vLLM N-gram Speculative Decoding Proposer
+# NgramTable — N-gram 投机解码实验平台
 
-基于哈希表的 N-gram 投机解码 Proposer，用于替代 vLLM 原生 KMP 方案，提供 O(1) 查询复杂度和跨会话频率积累能力。
+本项目提供两套 N-gram 投机解码（Speculative Decoding）实现，可独立运行：
 
-## 特性
+| 方案 | 分支 | 依赖 | 平台 |
+|------|------|------|------|
+| **vLLM 版**（原始） | `develop_cc` | vLLM + CUDA | Linux |
+| **Transformer 版**（本分支） | `develop_cc_transformer` | HuggingFace transformers | macOS / Linux / CPU |
 
-- **KMP 模式** — 原始 vLLM KMP 最长匹配算法，Numba JIT 加速
-- **Per-request 模式** — 每请求独立哈希表，增量更新，频率驱动的 best-next-token 选择
-- **Shared 模式** — 全局共享哈希表，跨请求/会话积累 n-gram 频率统计，异步持久化到磁盘
+---
 
-## 三种模式对比
+## Transformer 版（当前分支：`develop_cc_transformer`）
 
-| 特性 | KMP | Per-request | Shared |
-|------|-----|-------------|--------|
-| 查询复杂度 | O(n) | O(1) | O(1) |
-| 频率统计 | 无（最早匹配） | 请求内 | 跨请求积累 |
-| 状态生命周期 | 无状态 | 请求级 | 进程级 + 磁盘持久化 |
-| 内存占用 | 低 | 中（per-request 分配） | 固定（共享表） |
-| 适用场景 | 通用基线 | 长上下文单请求 | 高并发、重复模式多 |
+无需 vLLM，基于 HuggingFace `transformers` 实现，支持 macOS MPS、CUDA 和 CPU。
 
-## 环境变量
+### 架构概览
 
-### 模式选择
+```
+speculative/
+├── __init__.py           # 懒加载导出
+├── engine.py             # SpeculativeEngine：propose → verify → accept 主循环
+├── verifier.py           # TransformerVerifier（Qwen2.5-0.5B，greedy，temperature=0）
+├── metrics.py            # MetricsTracker：命中率、接受率、加速比
+└── proposers/
+    ├── base.py           # BaseProposer 抽象接口
+    ├── kmp_proposer.py   # KMP 最长后缀匹配
+    ├── hash_proposer.py  # 频率哈希表（O(1) 查询）
+    └── trie_proposer.py  # Token Trie（对齐 PainlessInferenceAcceleration）
+```
+
+### 三种草稿提案器（Proposer）
+
+| 提案器 | 算法 | 查询复杂度 | 状态 |
+|--------|------|-----------|------|
+| **KMP** | 最长后缀匹配扫描 | O(ctx × max_n) | 无状态 |
+| **HashTable** | n-gram 频率哈希表 | O(1) | 增量更新 |
+| **Trie** | Token 前缀树（对齐 PainlessIA） | O(max_n) | 增量更新 |
+
+**Trie 设计参考**：[PainlessInferenceAcceleration / lookahead_cache.py](https://github.com/alipay/PainlessInferenceAcceleration/blob/main/lookahead/lookahead/common/lookahead_cache.py)
+
+- `mem[t]` = 以 token `t` 为根的子 Trie（等价于 `LookaheadCache.mem[t] = Tree(t)`）
+- 插入：对每个位置 `i`，将 `context[i+1:i+max_n+1]` 作为路径插入 `mem[context[i]]`
+- 查询：从 `max_n` 到 `min_n` 依次尝试，取上下文最后 n 个 token 做前缀匹配
+
+### 验证器（Verifier）
+
+`TransformerVerifier` 封装 Qwen2.5-0.5B-Instruct：
+
+- **Greedy 验证**（temperature=0）：`argmax` 接受/拒绝，结果完全可复现
+- **KV 缓存管道**：`init_kv_cache()` + `verify_step()` — Context 只编码一次，每步只处理草稿 token
+- **简单验证**：`verify()` — 无 KV 缓存，全序列一次 forward（用于正确性测试）
+- **设备自动选择**：CUDA → MPS（Apple Silicon）→ CPU
+
+### 快速开始
 
 ```bash
-# 三选一，默认 kmp
-export VLLM_NGRAM_MODE=kmp          # 原始 KMP 算法
-export VLLM_NGRAM_MODE=per_request  # 每请求独立哈希表
-export VLLM_NGRAM_MODE=shared       # 共享持久化哈希表
+# 安装依赖（uv）
+uv sync
+
+# 运行单元测试（无需加载模型）
+uv run python test_transformer.py -v
+
+# 运行完整 benchmark（需要下载 Qwen2.5-0.5B，约 1GB）
+uv run python benchmark_transformer.py \
+    --num-samples 20 \
+    --proposers kmp hash trie \
+    --max-new-tokens 256 \
+    --num-speculative-tokens 5
 ```
 
-向后兼容：若 `VLLM_NGRAM_MODE` 未设置，回退检查旧环境变量 `VLLM_NGRAM_USE_HASH_TABLE=1`（等价于 `per_request`）。
+### Benchmark 参数
 
-### Shared 模式专用
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--verifier-model` | `Qwen/Qwen2.5-0.5B-Instruct` | HuggingFace 模型名 |
+| `--proposers` | `kmp hash trie` | 要对比的提案器（可多选） |
+| `--num-samples` | `20` | SWE-bench Lite 样本数 |
+| `--max-new-tokens` | `256` | 每请求最大生成 token 数 |
+| `--num-speculative-tokens` | `5` | 每步草稿 token 数 k |
+| `--min-n` / `--max-n` | `2` / `5` | n-gram 窗口范围 |
+| `--temperature` | `0.0` | 采样温度（0.0 = greedy） |
+| `--no-baseline` | — | 跳过自回归基线（加速测试） |
+| `--output` | `results/transformer_benchmark.json` | 结果保存路径 |
 
-```bash
-# 共享表槽位数（2 的幂），默认 1048576（1M）
-export VLLM_NGRAM_SHARED_TABLE_SIZE=1048576
+### 基准测试结果（参考，10 样本，Qwen2.5-0.5B，MPS）
 
-# 持久化目录，默认 ngram_hash
-export VLLM_NGRAM_SHARED_DIR=ngram_hash
+| 提案器 | 草稿命中率 | Token 接受率 | 平均接受长度 | 理论加速比 |
+|--------|-----------|-------------|-------------|----------|
+| KMP    | ~56%      | ~56%        | ~2.16       | ~2.16x   |
+| Hash   | ~60%      | ~60%        | ~2.21       | ~2.21x   |
+| Trie   | ~55%+     | ~55%+       | ~2.1+       | ~2.1x+   |
 
-# 后台刷盘间隔（秒），默认 60
-export VLLM_NGRAM_FLUSH_INTERVAL=60
-```
+> 实测加速比（墙时钟）需使用 KV 缓存管道（`verify_step`）才公平；以上为理论值。
 
-## 架构设计
+### 指标说明
 
-### 哈希表双表结构
+- **草稿命中率（draft_hit_rate）**：步骤中所有草稿 token 均被接受的步骤占比
+- **Token 接受率（token_acceptance_rate）**：被接受的草稿 token 数 / 总提议 token 数
+- **平均接受长度（mean_accepted_length）**：每步平均接受 token 数（含 bonus token）
+- **理论加速比**：`mean_accepted_length`，即相对于自回归基线每步平均减少的 forward pass 次数
 
-每个 n-gram 长度维护两张哈希表：
+### 文件说明
 
-1. **freq 表** — 统计 `(ngram, next_token) → count` 频率
-2. **lut 表** — 存储 `ngram → best_next_token` 查找映射（频率最高的 token）
+| 文件/目录 | 说明 |
+|-----------|------|
+| `speculative/` | 投机解码框架核心包 |
+| `benchmark_transformer.py` | 完整 benchmark CLI |
+| `test_transformer.py` | 单元 + 集成测试（24 项，不依赖模型） |
+| `pyproject.toml` | uv 项目配置 |
+| `lookahead方案.md` | Lookahead Decoding 详细设计文档 |
+| `results/` | benchmark 输出（JSON） |
 
-两表使用开放地址法 + 线性探测解决哈希冲突，共享基础 ngram 哈希值以减少重复计算。
+---
 
-### Shared 模式持久化
+## vLLM 版（分支：`develop_cc`）
 
-```
-ngram_hash/
-├── metadata.json    # 版本、min_n、max_n、table_size、时间戳
-├── n2.npz           # n=2 的频率表和查找表数组
-├── n3.npz           # n=3
-├── n4.npz           # n=4
-└── ...
-```
+基于 vLLM 的 N-gram 投机解码，使用 Numba JIT 加速的自定义哈希表替代原生 KMP 方案。
 
-- 使用 `np.savez_compressed` 存储，压缩率好，无额外依赖
-- 原子写入：先写 `.tmp` 文件再 `rename`，避免写入中断导致数据损坏
-- 后台 daemon 线程定期刷盘，持锁仅做数组 `.copy()`（微秒级），I/O 在锁外完成
-- 进程退出时通过 `atexit` 注册同步刷盘
+### 三种模式
 
-### 负载因子监控
+| 模式 | 环境变量 | 说明 |
+|------|---------|------|
+| KMP | `VLLM_NGRAM_MODE=kmp` | 原始 vLLM KMP 最长匹配 |
+| Per-request | `VLLM_NGRAM_MODE=per_request` | 每请求独立哈希表，增量更新 |
+| Shared | `VLLM_NGRAM_MODE=shared` | 全局共享表，跨请求/会话频率积累 |
 
-- Per-request 模式：负载因子 > 60% 时触发全量重建扩容
-- Shared 模式：负载因子 > 80% 时输出 warning 日志，提示增大 `VLLM_NGRAM_SHARED_TABLE_SIZE`
+详见 `develop_cc` 分支 README。
 
-## 文件说明
+---
 
-| 文件 | 说明 |
-|------|------|
-| `ngram_proposer.py` | 核心实现，含 KMP / Per-request / Shared 三种模式 |
-| `test_numba_hash.py` | 哈希表正确性单元测试（对比 Python dict 参考实现） |
-| `test_hash_vs_kmp.py` | 哈希表 vs KMP 方案的效果对比测试 |
-| `test_single_seq.py` | 单序列场景测试 |
-| `requirements.txt` | Python 依赖 |
+## 参考资料
 
-## 测试
-
-```bash
-# 运行哈希表正确性测试（需要 vllm 环境）
-python test_numba_hash.py
-
-# 运行哈希表 vs KMP 对比测试
-python test_hash_vs_kmp.py
-
-# 单序列测试
-python test_single_seq.py
-```
-
-> 注：测试需要在支持 CUDA 的 Linux 环境中运行（vLLM 依赖）。
-
-## 依赖
-
-- vLLM >= 0.6.0
-- PyTorch >= 2.0.0
-- NumPy
-- Numba
+- [PainlessInferenceAcceleration（Alipay）](https://github.com/alipay/PainlessInferenceAcceleration) — Lookahead Decoding 参考实现
+- [Speculative Decoding 论文](https://arxiv.org/abs/2211.17192) — Chen et al., 2022
+- [SWE-bench Lite](https://huggingface.co/datasets/princeton-nlp/SWE-bench_Lite) — 评测数据集
+- [Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct) — 默认验证器模型

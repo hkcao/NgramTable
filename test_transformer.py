@@ -138,12 +138,40 @@ class TestTrieProposer(unittest.TestCase):
         ctx = [1, 2, 3, 1, 2, 3]
         self.p.propose(ctx, 2)
         self.p.reset()
-        self.assertIsNone(self.p._root.best_next)
+        self.assertEqual(self.p.mem, {})
 
     def test_no_match_returns_empty(self):
         ctx = [10, 20]  # never seen before
         draft = self.p.propose(ctx, 2)
         self.assertEqual(draft, [])
+
+    def test_no_context_minus1_as_next_token(self):
+        # Regression: old single-pass traversal returned context[-1] as next token
+        # when node[prefix].best_next == context[-1].
+        # New design (aligned with PainlessInferenceAcceleration) must NOT do this.
+        # context ends with [B,C,D,E]; [B,C,D] was followed by E historically.
+        ctx = [2, 3, 4, 2, 3, 4, 5]   # [2,3,4]→5, context[-1]=5
+        draft = self.p.propose(ctx, 1)
+        # Must NOT propose 5 (already context[-1])
+        self.assertNotEqual(draft, [5])
+
+    def test_mem_structure(self):
+        # Verify mem[t] is keyed by first token and stores sub-trie
+        # (matches LookaheadCache.mem structure)
+        ctx = [1, 2, 3, 1, 2, 4]
+        self.p.propose(ctx, 1)
+        # mem[1] should exist (1 appeared as first token of several windows)
+        self.assertIn(1, self.p.mem)
+        # mem[1][2] should exist (1 was followed by 2)
+        self.assertIn(2, self.p.mem[1])
+
+    def test_greedy_chain_continuation(self):
+        # After finding first token, should follow greedy chain in same sub-trie
+        # (matches Tree.get_one_branch inner while loop)
+        ctx = [1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2]
+        draft = self.p.propose(ctx, 4)
+        # Pattern 1→2→3→4→5 should predict [3, 4, 5, ...]
+        self.assertEqual(draft[:3], [3, 4, 5])
 
 
 # ---------------------------------------------------------------------------
