@@ -198,20 +198,22 @@ def run_benchmark(
     max_n: int,
     run_baseline: bool,
     output_path: str,
+    temperature: float = 0.0,
 ):
     print("=" * 80)
     print("Transformer-based Speculative Decoding Benchmark")
-    print(f"Verifier model: {verifier_model}")
+    print(f"Verifier model:  {verifier_model}")
     print(f"Proposers:       {proposers}")
     print(f"Samples:         {num_samples}  |  max_new_tokens: {max_new_tokens}")
     print(f"Spec tokens:     {num_speculative_tokens}  |  n-gram: {min_n}..{max_n}")
+    print(f"Temperature:     {temperature}  (0.0 = greedy/reproducible)")
     print("=" * 80)
 
     prompts = build_swe_prompts(num_samples, max_prompt_chars)
 
     # Load verifier once; share across all proposer runs
-    logger.info("Loading verifier: %s", verifier_model)
-    verifier = TransformerVerifier(model_name=verifier_model)
+    logger.info("Loading verifier: %s (temperature=%.1f)", verifier_model, temperature)
+    verifier = TransformerVerifier(model_name=verifier_model, temperature=temperature)
 
     all_results: List[ProposerResult] = []
 
@@ -316,6 +318,12 @@ def main():
         help="Skip baseline autoregressive generation (faster)",
     )
     parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature (default: 0.0 = greedy, fully reproducible)",
+    )
+    parser.add_argument(
         "--output",
         default="results/transformer_benchmark.json",
         help="Output JSON path",
@@ -333,6 +341,7 @@ def main():
         max_n=args.max_n,
         run_baseline=not args.no_baseline,
         output_path=args.output,
+        temperature=args.temperature,
     )
 
 

@@ -108,21 +108,30 @@ class TrieProposer(BaseProposer):
 
     def _query(self, context_ids: List[int]) -> Optional[int]:
         """
-        Traverse the trie using the last min(max_n, ctx_len) tokens of context.
-        Return the best next token at the deepest node reached with next_freq.
+        Find the longest n-gram (n = max_n..min_n) whose tokens match
+        context_ids[-n:] exactly, and return its best_next.
+
+        Critically, we try each n-gram length *independently* starting from
+        the newest tokens (context[-n:]), not from the oldest.  This ensures
+        every candidate n-gram ends at context[-1], so the returned token is
+        always the prediction for what comes *after* the current context tail.
+
+        (The naive single-pass "traverse from oldest token, keep deepest best"
+        approach is wrong: if traversal stops at depth d, best_next reflects
+        what followed context[-n : -n+d] — a prefix that may not include
+        context[-1], so the "next token" prediction is actually a token that
+        is *already in* the context.)
         """
         ctx_len = len(context_ids)
-        suffix_len = min(self.max_n, ctx_len)
-        suffix = context_ids[ctx_len - suffix_len :]
-
-        node = self._root
-        best: Optional[int] = None
-
-        for tok in suffix:
-            if tok not in node.children:
-                break
-            node = node.children[tok]
-            if node.best_next is not None:
-                best = node.best_next  # keep deepest valid best
-
-        return best
+        for n in range(min(self.max_n, ctx_len), self.min_n - 1, -1):
+            suffix = context_ids[ctx_len - n:]
+            node = self._root
+            for tok in suffix:
+                if tok not in node.children:
+                    break
+                node = node.children[tok]
+            else:
+                # Full path matched — return prediction if available
+                if node.best_next is not None:
+                    return node.best_next
+        return None
