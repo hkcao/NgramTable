@@ -1,8 +1,9 @@
 """
-Benchmark: Hash-table NGram vs KMP NGram vs Baseline on Qwen model.
+Benchmark: KMP vs Hash vs Trie vs Suffix Decoding vs Baseline on Qwen model.
 
 Sends single requests sequentially to measure per-request latency.
-Uses VLLM_NGRAM_USE_HASH env var to switch between hash and KMP modes.
+Uses VLLM_NGRAM_USE_HASH / VLLM_NGRAM_USE_TRIE env vars to switch ngram modes.
+Suffix Decoding uses method="suffix" with arctic-inference backend.
 """
 
 import argparse
@@ -92,11 +93,13 @@ def _run_single_seq(
     use_hash: bool,
     num_warmup: int,
     result_queue: mp.Queue,
+    use_trie: bool = False,
 ):
     import torch as _torch
 
-    # Set the mode switch env var BEFORE importing vllm
+    # Set the mode switch env vars BEFORE importing vllm
     os.environ["VLLM_NGRAM_USE_HASH"] = "1" if use_hash else "0"
+    os.environ["VLLM_NGRAM_USE_TRIE"] = "1" if use_trie else "0"
 
     from vllm import LLM, SamplingParams
     from vllm.v1.metrics.reader import Counter as MCounter
@@ -116,7 +119,7 @@ def _run_single_seq(
 
     try:
         print(f"\n{'=' * 70}")
-        print(f"Mode: {mode_name}  (VLLM_NGRAM_USE_HASH={use_hash})")
+        print(f"Mode: {mode_name}  (HASH={use_hash} TRIE={use_trie})")
         print(f"{'=' * 70}")
 
         llm_kwargs = dict(
@@ -246,13 +249,13 @@ def _run_single_seq(
 
 def run_config_in_subprocess(prompt_texts, model_name, gpu_mem, max_tokens,
                              spec_config, mode_name, use_hash=False,
-                             num_warmup=2):
+                             num_warmup=2, use_trie=False):
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
     p = ctx.Process(
         target=_run_single_seq,
         args=(prompt_texts, model_name, gpu_mem, max_tokens,
-              spec_config, mode_name, use_hash, num_warmup, q),
+              spec_config, mode_name, use_hash, num_warmup, q, use_trie),
     )
     p.start()
     p.join(timeout=1200)
@@ -272,7 +275,7 @@ def run_config_in_subprocess(prompt_texts, model_name, gpu_mem, max_tokens,
 def run_benchmark(model_name, num_samples, max_tokens, ngram_configs,
                   max_prompt_len, gpu_mem):
     print("=" * 70)
-    print("Hash-table NGram vs KMP NGram Benchmark")
+    print("KMP vs Hash vs Trie vs Suffix Decoding Benchmark")
     print(f"Model: {model_name}")
     print(f"Samples: {num_samples}  |  max_tokens: {max_tokens}")
     print(f"GPU mem utilization: {gpu_mem}")
@@ -280,7 +283,8 @@ def run_benchmark(model_name, num_samples, max_tokens, ngram_configs,
 
     prompt_texts = build_swe_prompts(num_samples, max_prompt_len)
     all_results = []
-    total_runs = 1 + len(ngram_configs) * 2
+    # baseline + 3 ngram modes per config + 1 suffix per config
+    total_runs = 1 + len(ngram_configs) * 4
     run_idx = 0
 
     # 1. Baseline (no speculative decoding)
@@ -293,7 +297,7 @@ def run_benchmark(model_name, num_samples, max_tokens, ngram_configs,
     all_results.append(r)
     time.sleep(2)
 
-    # 2. For each ngram config: KMP then Hash
+    # 2. For each ngram config: KMP, Hash, Trie, then Suffix
     for cfg in ngram_configs:
         spec_config = {
             "method": "ngram",
@@ -311,7 +315,7 @@ def run_benchmark(model_name, num_samples, max_tokens, ngram_configs,
         r = run_config_in_subprocess(
             prompt_texts, model_name, gpu_mem, max_tokens,
             spec_config=spec_config, mode_name=label_kmp,
-            use_hash=False,
+            use_hash=False, use_trie=False,
         )
         all_results.append(r)
         time.sleep(2)
@@ -323,15 +327,44 @@ def run_benchmark(model_name, num_samples, max_tokens, ngram_configs,
         r = run_config_in_subprocess(
             prompt_texts, model_name, gpu_mem, max_tokens,
             spec_config=spec_config, mode_name=label_ht,
-            use_hash=True,
+            use_hash=True, use_trie=False,
+        )
+        all_results.append(r)
+        time.sleep(2)
+
+        # Trie mode
+        run_idx += 1
+        label_trie = f"Trie {tag}"
+        print(f"\n>>> [{run_idx}/{total_runs}] {label_trie} ...")
+        r = run_config_in_subprocess(
+            prompt_texts, model_name, gpu_mem, max_tokens,
+            spec_config=spec_config, mode_name=label_trie,
+            use_hash=False, use_trie=True,
+        )
+        all_results.append(r)
+        time.sleep(2)
+
+        # Suffix Decoding mode (uses same num_speculative_tokens for
+        # fair comparison)
+        run_idx += 1
+        label_suffix = f"Suffix {tag}"
+        print(f"\n>>> [{run_idx}/{total_runs}] {label_suffix} ...")
+        suffix_spec_config = {
+            "method": "suffix",
+            "num_speculative_tokens": cfg["num_speculative_tokens"],
+        }
+        r = run_config_in_subprocess(
+            prompt_texts, model_name, gpu_mem, max_tokens,
+            spec_config=suffix_spec_config, mode_name=label_suffix,
+            use_hash=False, use_trie=False,
         )
         all_results.append(r)
         time.sleep(2)
 
     # 3. Summary
-    print("\n\n" + "=" * 120)
+    print("\n\n" + "=" * 130)
     print("RESULTS SUMMARY")
-    print("=" * 120)
+    print("=" * 130)
 
     valid = [r for r in all_results if "error" not in r]
     errors = [r for r in all_results if "error" in r]
@@ -348,7 +381,7 @@ def run_benchmark(model_name, num_samples, max_tokens, ngram_configs,
     hdr = (f"{'Mode':<35} {'AvgLat':>8} {'MedLat':>8} {'P90Lat':>8} "
            f"{'tok/s':>8} {'Speedup':>8} {'Accept%':>8} {'MeanLen':>8}")
     print(hdr)
-    print("-" * 110)
+    print("-" * 120)
 
     for r in valid:
         lat_ratio = base_avg / r["avg_latency"] if r["avg_latency"] > 0 else 0
@@ -364,35 +397,56 @@ def run_benchmark(model_name, num_samples, max_tokens, ngram_configs,
               f"{lat_ratio:>8.2f}x "
               f"{acc:>8} {mlen:>8}")
 
-    # Pairwise KMP vs Hash
-    print("\n" + "=" * 70)
-    print("KMP vs Hash Pairwise Comparison")
-    print("=" * 70)
+    # Pairwise comparison: KMP vs Hash vs Trie vs Suffix
+    print("\n" + "=" * 100)
+    print("KMP vs Hash vs Trie vs Suffix Pairwise Comparison")
+    print("=" * 100)
     kmp_results = {r["mode"]: r for r in valid if r["mode"].startswith("KMP")}
     ht_results = {r["mode"]: r for r in valid if r["mode"].startswith("Hash")}
+    trie_results = {r["mode"]: r for r in valid if r["mode"].startswith("Trie")}
+    suffix_results = {r["mode"]: r for r in valid
+                      if r["mode"].startswith("Suffix")}
+
     for kmp_name, kmp_r in kmp_results.items():
         ht_name = kmp_name.replace("KMP", "Hash")
+        trie_name = kmp_name.replace("KMP", "Trie")
+        suffix_name = kmp_name.replace("KMP", "Suffix")
         ht_r = ht_results.get(ht_name)
-        if not ht_r:
-            continue
+        trie_r = trie_results.get(trie_name)
+        suffix_r = suffix_results.get(suffix_name)
         tag = kmp_name.replace("KMP ", "")
-        kmp_avg = kmp_r["avg_latency"]
-        ht_avg = ht_r["avg_latency"]
-        lat_ratio = kmp_avg / ht_avg if ht_avg > 0 else 0
-        kmp_tps = kmp_r["output_tokens_per_second"]
-        ht_tps = ht_r["output_tokens_per_second"]
-        tps_ratio = ht_tps / kmp_tps if kmp_tps > 0 else 0
-        kmp_acc = (kmp_r.get("acceptance_stats", {})
+
+        print(f"\n  {tag}:")
+
+        entries = [("KMP", kmp_r)]
+        if ht_r:
+            entries.append(("Hash", ht_r))
+        if trie_r:
+            entries.append(("Trie", trie_r))
+        if suffix_r:
+            entries.append(("Suffix", suffix_r))
+
+        for label, r in entries:
+            avg = r["avg_latency"]
+            tps = r["output_tokens_per_second"]
+            acc = (r.get("acceptance_stats", {})
                    .get("acceptance_rate_pct", 0))
-        ht_acc = (ht_r.get("acceptance_stats", {})
-                  .get("acceptance_rate_pct", 0))
-        print(f"  {tag}:")
-        print(f"    KMP:  avg_lat={kmp_avg:.3f}s  "
-              f"tps={kmp_tps:.1f}  accept={kmp_acc:.1f}%")
-        print(f"    Hash: avg_lat={ht_avg:.3f}s  "
-              f"tps={ht_tps:.1f}  accept={ht_acc:.1f}%")
-        print(f"    Hash/KMP: latency {lat_ratio:.3f}x  "
-              f"throughput {tps_ratio:.3f}x")
+            mlen = (r.get("acceptance_stats", {})
+                    .get("mean_accepted_length", 0))
+            print(f"    {label:<8}: avg_lat={avg:.3f}s  "
+                  f"tps={tps:.1f}  accept={acc:.1f}%  "
+                  f"mean_len={mlen:.2f}")
+
+        # Ratios vs KMP
+        kmp_avg = kmp_r["avg_latency"]
+        kmp_tps = kmp_r["output_tokens_per_second"]
+        for label, r in entries[1:]:
+            r_avg = r["avg_latency"]
+            r_tps = r["output_tokens_per_second"]
+            if r_avg > 0 and kmp_tps > 0:
+                print(f"    {label}/KMP:  latency "
+                      f"{kmp_avg / r_avg:.3f}x  throughput "
+                      f"{r_tps / kmp_tps:.3f}x")
 
     # Save results
     out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -402,7 +456,7 @@ def run_benchmark(model_name, num_samples, max_tokens, ngram_configs,
             "model": model_name,
             "num_samples": num_samples,
             "max_tokens": max_tokens,
-            "mode": "hash_vs_kmp",
+            "mode": "kmp_vs_hash_vs_trie_vs_suffix",
             "results": all_results,
         }, f, ensure_ascii=False, indent=2, default=str)
     print(f"\nResults saved to: {out_path}")
@@ -410,7 +464,7 @@ def run_benchmark(model_name, num_samples, max_tokens, ngram_configs,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Hash-table NGram vs KMP benchmark on Qwen")
+        description="KMP vs Hash vs Trie vs Suffix benchmark on Qwen")
     parser.add_argument("--model", default="Qwen/Qwen2.5-3B-Instruct")
     parser.add_argument("--num-samples", type=int, default=20)
     parser.add_argument("--max-tokens", type=int, default=512)
