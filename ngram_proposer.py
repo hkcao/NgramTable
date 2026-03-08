@@ -620,6 +620,14 @@ class NgramProposer:
         self._hash_table: dict[int, int] = {}
         # Per-request tracking for incremental updates
         self._req_last_num_tokens: dict[int, int] = {}
+        # Per-request local frequency table (request-specific patterns)
+        self._req_local_freq: dict[int, dict[tuple, Counter]] = {}
+        # Weight for local freq when merging with global freq
+        self._local_freq_weight: float = float(os.environ.get(
+            "VLLM_NGRAM_LOCAL_WEIGHT", "3.0"))
+        # Minimum confidence threshold for drafting
+        self._min_confidence: float = float(os.environ.get(
+            "VLLM_NGRAM_MIN_CONFIDENCE", "0.3"))
         # Update counter for periodic persistence
         self._update_count: int = 0
         # Lock for async persistence
@@ -764,51 +772,127 @@ class NgramProposer:
     # Private: hash-table-based draft token proposal
     # ------------------------------------------------------------------
 
+    def _get_merged_counter(
+        self,
+        context: tuple,
+        req_idx: int,
+    ) -> Counter | None:
+        """Get merged frequency counter: global + local (weighted).
+
+        Returns None if context not found in either table.
+        """
+        global_cnt = self._freq_table.get(context)
+        local_table = self._req_local_freq.get(req_idx)
+        local_cnt = local_table.get(context) if local_table else None
+
+        if global_cnt is None and local_cnt is None:
+            return None
+        if local_cnt is None:
+            return global_cnt
+        if global_cnt is None:
+            return local_cnt
+
+        # Merge: global + local * weight
+        merged = Counter(global_cnt)
+        w = self._local_freq_weight
+        for tok, cnt in local_cnt.items():
+            merged[tok] += int(cnt * w)
+        return merged
+
+    def _check_confidence(self, counter: Counter) -> tuple[int | None, float]:
+        """Return (best_token, confidence) from a frequency counter.
+
+        confidence = top_count / total_count.
+        """
+        if not counter:
+            return None, 0.0
+        best_token, top_count = counter.most_common(1)[0]
+        total = sum(counter.values())
+        confidence = top_count / total if total > 0 else 0.0
+        return best_token, confidence
+
+    def _vote_ngrams(
+        self,
+        input_ids: list[int],
+        candidate: int,
+        req_idx: int,
+    ) -> bool:
+        """Multi n-gram voting: check if multiple n-gram windows agree on
+        the candidate token. Returns True if majority agrees."""
+        n_max = min(self.max_n, len(input_ids))
+        if n_max < self.min_n:
+            return True  # Can't vote, trust the candidate
+
+        votes_for = 0
+        votes_total = 0
+        for n in range(self.min_n, n_max + 1):
+            context = tuple(input_ids[-n:])
+            counter = self._get_merged_counter(context, req_idx)
+            if counter:
+                votes_total += 1
+                best, _ = self._check_confidence(counter)
+                if best == candidate:
+                    votes_for += 1
+
+        if votes_total == 0:
+            return True  # No info, trust it
+        return votes_for >= (votes_total + 1) // 2  # Majority
+
     def _propose_tokens_hash(
         self,
         input_ids: list[int],
         k: int,
+        req_idx: int = 0,
     ) -> list[int]:
-        """Generate k draft tokens by chained hash-table lookups.
+        """Generate k draft tokens with confidence filtering, multi n-gram
+        voting, and request-local frequency overlay.
 
-        Starting from the last n tokens of input_ids, look up the hash table
-        to get the next predicted token. Then shift the window by 1 (drop
-        the oldest, append the predicted token) and repeat k times.
-
-        Example: input_ids ends with [A, B, C], n=3
-          hash((A,B,C)) -> E
-          hash((B,C,E)) -> G
-          hash((C,E,G)) -> F
-          result: [E, G, F]
+        Optimizations over plain chain lookup:
+        1. Confidence filtering: stop when confidence < threshold
+        2. Multi n-gram voting: only continue when majority of n-gram
+           windows agree on the candidate
+        3. Request-local freq overlay: merge global + local (weighted)
+           for better position-specific predictions
         """
         drafts: list[int] = []
-        # Use the largest n that fits
         n = min(self.max_n, len(input_ids))
         if n < self.min_n:
             return drafts
 
-        # Current context window (mutable list for shifting)
-        window = list(input_ids[-n:])
+        # Build extended input for voting context
+        extended = list(input_ids)
 
-        for _ in range(k):
-            h = hash(tuple(window))
-            next_token = self._hash_table.get(h)
-            if next_token is None:
-                # Try smaller n-grams as fallback
-                found = False
-                for fallback_n in range(n - 1, self.min_n - 1, -1):
-                    fallback_window = tuple(window[-fallback_n:])
-                    fh = hash(fallback_window)
-                    next_token = self._hash_table.get(fh)
-                    if next_token is not None:
-                        found = True
-                        break
-                if not found:
-                    break
-            drafts.append(next_token)
-            # Shift window: drop oldest, append predicted token
-            window.pop(0)
-            window.append(next_token)
+        for step in range(k):
+            best_token = None
+            best_confidence = 0.0
+
+            # Try from longest to shortest n-gram
+            for try_n in range(n, self.min_n - 1, -1):
+                if try_n > len(extended):
+                    continue
+                context = tuple(extended[-try_n:])
+                counter = self._get_merged_counter(context, req_idx)
+                if counter:
+                    token, conf = self._check_confidence(counter)
+                    if token is not None and conf > best_confidence:
+                        best_token = token
+                        best_confidence = conf
+                        if conf >= self._min_confidence:
+                            break  # Good enough, use longest confident match
+
+            if best_token is None:
+                break  # No match at all
+
+            # Confidence filter: stop if too uncertain
+            if best_confidence < self._min_confidence:
+                break
+
+            # Multi n-gram voting: check consensus
+            if not self._vote_ngrams(extended, best_token, req_idx):
+                break  # Disagreement among n-gram windows
+
+            drafts.append(best_token)
+            extended.append(best_token)
 
         return drafts
 
@@ -926,6 +1010,27 @@ class NgramProposer:
             )
             return draft_token_ids
 
+    def _update_local_freq_table(
+        self,
+        token_ids: list[int],
+        n_new: int,
+        req_idx: int,
+    ) -> None:
+        """Incremental update of per-request local frequency table."""
+        if req_idx not in self._req_local_freq:
+            self._req_local_freq[req_idx] = {}
+        local = self._req_local_freq[req_idx]
+
+        total = len(token_ids)
+        for n in range(self.min_n, self.max_n + 1):
+            start = max(0, total - n_new - n)
+            for i in range(start, total - n):
+                context = tuple(token_ids[i:i + n])
+                next_token = token_ids[i + n]
+                if context not in local:
+                    local[context] = Counter()
+                local[context][next_token] += 1
+
     def _propose_hash_mode(
         self,
         sampled_token_ids: list[list[int]],
@@ -950,18 +1055,21 @@ class NgramProposer:
             # Detect new request vs continuation
             prev_len = self._req_last_num_tokens.get(i)
             if prev_len is None or num_tokens < prev_len:
-                # New request: build tables from prompt if tables are empty
+                # New request: reset local freq table
+                self._req_local_freq[i] = {}
+                # Build/update global tables
                 if not self._freq_table:
                     self._build_tables_from_tokens(tokens)
                 else:
-                    # Tables exist (loaded from disk or prior request),
-                    # still update with this prompt's n-grams
                     self._update_freq_table(tokens, num_tokens)
+                # Build local freq from full prompt
+                self._update_local_freq_table(tokens, num_tokens, i)
             else:
                 # Continuation: incremental update with new tokens
                 n_new = num_tokens - prev_len
                 if n_new > 0:
                     self._update_freq_table(tokens, n_new)
+                    self._update_local_freq_table(tokens, n_new, i)
 
             self._req_last_num_tokens[i] = num_tokens
 
@@ -971,7 +1079,7 @@ class NgramProposer:
                 draft_token_ids.append([])
                 continue
 
-            drafts = self._propose_tokens_hash(tokens, k)
+            drafts = self._propose_tokens_hash(tokens, k, req_idx=i)
             draft_token_ids.append(drafts)
 
         return draft_token_ids

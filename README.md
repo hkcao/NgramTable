@@ -56,24 +56,39 @@ Suffix Decoding 通过 `speculative_config={"method": "suffix"}` 启用，走 vL
 
 在 reversed token 序列上用 KMP failure function 找最长前缀匹配，等价于在原始序列中找与末尾 n-gram 匹配的最早位置，复制其后续 token。Numba JIT 加速，支持 batch 并行。
 
-### Hash
+### Hash（优化版）
 
-维护两张表（统一持久化为 pickle）：
+维护三层数据结构：
 
-- **FreqTable**：`dict[tuple[int,...], Counter[int]]` — n-gram context → 后续 token 频次
-- **HashTable**：`dict[int, int]` — `hash(context_tuple)` → argmax token
+- **FreqTable**（全局）：`dict[tuple[int,...], Counter[int]]` — n-gram context → 后续 token 频次，跨请求持久化
+- **HashTable**：`dict[int, int]` — `hash(context_tuple)` → argmax token，用于快速查询
+- **LocalFreqTable**（请求级）：每个请求独立的局部频率表，提升位置特异性
 
-查询时链式查表：
+查询时链式查表，配合三项优化：
 
 ```
 input: [..., A, B, C]  n=3, k=3
-hash((A,B,C)) -> E
-hash((B,C,E)) -> G
-hash((C,E,G)) -> F
-output: [E, G, F]
+
+step 1: merged_freq((A,B,C)) = global + local*3.0
+         confidence = top_count/total → 0.75 > 0.3 ✓
+         vote: 3-gram, 2-gram, 4-gram 多数同意 ✓ → E
+step 2: merged_freq((B,C,E)) → confidence 0.45 > 0.3 ✓, vote ✓ → G
+step 3: merged_freq((C,E,G)) → confidence 0.20 < 0.3 ✗ → 停止
+output: [E, G]  (只出高置信 draft，不盲猜满 k 个)
 ```
 
-查表失败时自动 fallback 到更短的 n-gram。
+**三项优化**：
+
+1. **置信度过滤**：每步计算 `top_count / total`，低于阈值（默认 0.3）时停止链式推理，避免盲猜
+2. **多 n-gram 投票**：每步同时查询所有 n-gram 窗口（min_n ~ max_n），多数不一致时终止，缓解链式误差放大
+3. **请求局部频率叠加**：全局频率 + 请求局部频率（权重 3.0）合并后取 argmax，提升当前上下文的位置特异性
+
+环境变量配置：
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `VLLM_NGRAM_MIN_CONFIDENCE` | `0.3` | 置信度阈值，低于此值停止 draft |
+| `VLLM_NGRAM_LOCAL_WEIGHT` | `3.0` | 局部频率权重 |
 
 ### Trie（复现 LookaheadCache）
 
@@ -129,11 +144,11 @@ Qwen2.5-3B-Instruct, 单请求顺序模式, temp=0, 20 samples, SWE-bench Lite:
 
 | Mode | AvgLat | tok/s | Speedup | Accept% | MeanLen |
 |---|---|---|---|---|---|
-| baseline | 5.811s | 88.1 | 1.00x | - | - |
-| KMP spec=5 n=2-5 | 3.346s | 153.0 | 1.74x | 50.6% | 3.52 |
-| Hash spec=5 n=2-5 | 3.320s | 154.2 | 1.75x | 39.8% | 2.99 |
-| Trie spec=5 n=2-5 | 3.179s | 161.1 | 1.83x | 26.8% | 2.33 |
-| Suffix spec=5 | 2.948s | 171.6 | **1.97x** | **60.3%** | 2.57 |
+| baseline | 5.779s | 88.6 | 1.00x | - | - |
+| KMP spec=5 n=2-5 | 3.395s | 150.8 | 1.70x | 50.6% | 3.52 |
+| Hash spec=5 n=2-5 | 3.188s | 160.6 | 1.81x | 47.2% | 3.25 |
+| Trie spec=5 n=2-5 | 3.221s | 159.0 | 1.79x | 26.8% | 2.33 |
+| Suffix spec=5 | 2.941s | 171.9 | **1.96x** | **60.3%** | 2.57 |
 
 ### 详细统计（spec=5）
 
@@ -157,15 +172,22 @@ Qwen2.5-3B-Instruct, 单请求顺序模式, temp=0, 20 samples, SWE-bench Lite:
 
 **局限**：draft 频率低，很多 step 退化为逐 token 生成。
 
-### Hash — 39.8%：全局频率 argmax，"多数投票"
+### Hash — 47.2%（优化后）：置信度过滤 + 多 n-gram 投票 + 局部叠加
 
-**机制**：对所有见过的 n-gram 统计频次，每个 context 取 argmax（出现最多的 next token），然后链式查表生成 k 个 draft。
+**机制**：全局 + 请求局部频率合并后取 argmax，链式推理过程中通过置信度过滤和多 n-gram 投票动态控制 draft 长度。
 
-**低于 KMP 的原因**：
+**优化前后对比**（spec=5）：
 
-- **全局 argmax ≠ 当前上下文最优**。假设 context `(A,B,C)` 后面 60% 跟 `X`，40% 跟 `Y`，Hash 永远预测 `X`。但在当前生成中模型可能选 `Y`——这种"平均化"丢失了位置特异性
-- **链式误差放大**。第 1 个 draft 错误概率 ~43%，一旦第 1 个错，后续全部基于错误上下文查表，整条链路全废。per_pos 数据 `[56.7%, 44.8%, 36.4%, 31.9%, 29.3%]` 逐位衰减正是链式误差放大的体现
-- **总是盲猜满 k 个**。avg_draft/step = 5.00，不确定时也强行填满，拉低总体命中率
+| 版本 | Accept% | tok/s | Speedup | avg_draft/step |
+|---|---|---|---|---|
+| 优化前（纯 argmax 链式） | 39.8% | 154.2 | 1.75x | 5.00 |
+| **优化后** | **47.2%** | **160.6** | **1.81x** | **3.25** |
+
+**三项优化的作用**：
+
+1. **置信度过滤**（最核心）：avg_draft/step 从 5.00 降到 3.25，不再盲猜满 k 个。低置信时及早终止，大幅降低浪费率
+2. **多 n-gram 投票**：当多个 n-gram 窗口对候选 token 不一致时终止链式推理，缓解了误差放大
+3. **请求局部频率叠加**：局部频率权重 3.0 叠加全局频率，让 argmax 更贴近当前请求上下文
 
 ### Trie — 26.8%：mix 模式 + 2 token 上下文
 
@@ -233,6 +255,6 @@ Suffix 的后缀树包含所有 token（不区分 input/output mode），从第 
 | 方案 | 策略 | 适用场景 |
 |---|---|---|
 | KMP | 精确后缀匹配，找到就准，找不到就不猜 | 高重复文本（代码模板、结构化输出） |
-| Hash | 全局频率 argmax 链式推理，总能猜但常猜错 | 跨请求持久化积累统计 |
+| Hash | 频率 argmax + 置信度过滤 + 投票 + 局部叠加 | 跨请求持久化 + 高吞吐 batch（O(1) 查询） |
 | Trie | 复现 LookaheadCache，mix 模式 1:1 加权，2 token 上下文 | 长期服务、多轮对话（历史持续积累） |
 | Suffix | 后缀树 + 概率过滤 + 动态长度，只出高置信 draft | **通用场景最优**，单请求即可发挥 |
