@@ -130,7 +130,7 @@ class TrieTree:
 
     def get(self, token_ids: list[int], max_size: int = 64,
             max_length: int = 8, min_input_size: int = 0,
-            min_output_size: int = 0, output_weight: float = 1e-4,
+            min_output_size: int = 0, output_weight: float = 0.5,
             mode: str = 'mix', idx: int = 0):
         """Multi-branch query — faithful reproduction of Tree.get."""
         assert mode in ('input', 'output', 'mix')
@@ -234,7 +234,7 @@ class TrieTree:
     def _ravel(self, nodes: dict, ids: list, mask, pid: int,
                max_size: int = 64, max_length: int = 8,
                min_output_freq: float = 1.0, min_input_freq: float = 1.0,
-               min_mix_freq: float = 1.0, output_weight: float = 1e-4,
+               min_mix_freq: float = 1.0, output_weight: float = 0.5,
                sizes: list | None = None, mode: str = 'mix',
                idx: int = 0):
         if len(ids) >= max_size or max_length <= 0:
@@ -309,7 +309,7 @@ class TrieTree:
                     fo = node.freqs.get(idx, 0.0)
                     fi = node.freqs.get(-1, 0.0)
                     if fo > 0 or fi > 0:
-                        freq = 10000 * fi + fo
+                        freq = fi + fo
                         if freq > max_freq:
                             max_freq = freq
                             max_node = node
@@ -1079,7 +1079,7 @@ class NgramProposer:
                 context, branch_length=bl,
                 decoding_length=dl,
                 min_output_size=min_output_size,
-                mode='output', idx=i)
+                mode='mix', idx=i)
             # Truncate to at most k drafts
             draft_token_ids.append(drafts[:k])
 

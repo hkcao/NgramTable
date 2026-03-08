@@ -83,7 +83,7 @@ output: [E, G, F]
 - **写入路径**：prompt token 以 `mode='input'` 写入，生成 token 以 `stream_put(mode='output')` 增量写入
 - **查询路径**：`hier_get()` 左到右滑动窗口 → `tree.get()` 多分支 DFS 展开（`_dfs_get_freqs` + `_ravel`）→ 返回 `(ids, mask, sizes)` 树形结果
 - **vLLM 适配**：在多分支结果上沿 DFS 首路径提取贪心最优单分支，作为 draft token 序列
-- **调用约定**：匹配原始调用方，只传最后 2 个 token 作为上下文，`mode='output'`
+- **调用约定**：匹配原始调用方，只传最后 2 个 token 作为上下文，`mode='mix'`（input/output 频率 1:1 加权）
 - **剪枝**：half-decay pruning，`squeeze_branch_counts` 每 1024 次更新触发
 
 ### Suffix Decoding（Arctic Inference）
@@ -129,11 +129,11 @@ Qwen2.5-3B-Instruct, 单请求顺序模式, temp=0, 20 samples, SWE-bench Lite:
 
 | Mode | AvgLat | tok/s | Speedup | Accept% | MeanLen |
 |---|---|---|---|---|---|
-| baseline | 5.797s | 88.3 | 1.00x | - | - |
-| KMP spec=5 n=2-5 | 3.362s | 152.3 | 1.72x | 50.6% | 3.52 |
-| Hash spec=5 n=2-5 | 3.330s | 153.8 | 1.74x | 39.8% | 2.99 |
-| Trie spec=5 n=2-5 | 3.198s | 160.1 | 1.81x | 26.7% | 2.32 |
-| Suffix spec=5 | 2.956s | 171.1 | **1.96x** | **60.3%** | 2.57 |
+| baseline | 5.811s | 88.1 | 1.00x | - | - |
+| KMP spec=5 n=2-5 | 3.346s | 153.0 | 1.74x | 50.6% | 3.52 |
+| Hash spec=5 n=2-5 | 3.320s | 154.2 | 1.75x | 39.8% | 2.99 |
+| Trie spec=5 n=2-5 | 3.179s | 161.1 | 1.83x | 26.8% | 2.33 |
+| Suffix spec=5 | 2.948s | 171.6 | **1.97x** | **60.3%** | 2.57 |
 
 ### 详细统计（spec=5）
 
@@ -167,27 +167,33 @@ Qwen2.5-3B-Instruct, 单请求顺序模式, temp=0, 20 samples, SWE-bench Lite:
 - **链式误差放大**。第 1 个 draft 错误概率 ~43%，一旦第 1 个错，后续全部基于错误上下文查表，整条链路全废。per_pos 数据 `[56.7%, 44.8%, 36.4%, 31.9%, 29.3%]` 逐位衰减正是链式误差放大的体现
 - **总是盲猜满 k 个**。avg_draft/step = 5.00，不确定时也强行填满，拉低总体命中率
 
-### Trie — 26.7%：output-only 模式 + 冷启动
+### Trie — 26.8%：mix 模式 + 2 token 上下文
 
-**机制**：在 Trie 中查找当前末尾 2 个 token 的后续模式，只使用 output 频率（`mode='output'`）的节点。完整复现 LookaheadCache 的 `hier_get` 逻辑。
+**机制**：在 Trie 中查找当前末尾 2 个 token 的后续模式，使用 `mode='mix'`（input/output 频率 1:1 加权）。完整复现 LookaheadCache 的 `hier_get` 逻辑。
 
-**最低接受率的根本原因——冷启动问题**：
+**最低接受率的根本原因**：
 
 ```
 请求开始 → put(prompt, mode='input')    → prompt 模式存为 input freq
 生成 token → stream_put(new, mode='output') → 逐渐积累 output freq
-查询时    → get(context, mode='output')   → 只看 output freq > 0 的节点
+查询时    → get(context, mode='mix')     → input + output 频率 1:1 加权
 ```
 
-在单请求隔离测试中：
+**三种 mode 实测对比**（spec=5）：
 
-1. **生成的前 N 个 token 完全没有 output 历史**。查询全部落空，返回空 draft
-2. **原始 LookaheadCache 设计用于多轮/批量推理**，不同请求的 output 模式相互补充。但我们的测试每个请求独立子进程，output 历史无法跨请求传递
-3. **2 token 上下文区分度极低**。即使有一些 output 历史，只用最后 2 个 token 做匹配，容易命中无关模式
+| mode | 权重 | Accept% | tok/s | Speedup |
+|---|---|---|---|---|
+| output | output only | 26.7% | 160.1 | 1.81x |
+| mix (原始 10000:1) | input 主导 | 26.1% | 157.0 | 1.78x |
+| **mix (1:1)** | **均衡** | **26.8%** | **161.1** | **1.83x** |
 
-**数据验证**：Trie 发起了 4129 次 draft（最多！），产生 20454 个 draft token，但 73.3% 被浪费。per_pos 第 1 位只有 40.7%，远低于其他方案。
+三种模式差异极小，说明瓶颈不在权重配置，而在：
 
-> **注**：Trie 方案在跨请求持久化场景（output 模式充分积累）下表现应会显著改善。
+1. **2 token 上下文区分度极低**。只用最后 2 个 token 做匹配，容易命中无关模式
+2. **单请求隔离测试**。原始 LookaheadCache 设计用于多轮/批量推理，不同请求的历史相互补充。但测试中每个请求独立子进程，历史无法跨请求传递
+3. **总是盲猜满 k 个**。avg_draft/step ≈ 4.95，不确定时也强行填满，拉低总体命中率
+
+> **注**：Trie 方案在跨请求持久化场景（历史充分积累）下表现应会显著改善。
 
 ### Suffix — 60.3%：概率过滤 + 全模式 + 动态长度
 
@@ -228,5 +234,5 @@ Suffix 的后缀树包含所有 token（不区分 input/output mode），从第 
 |---|---|---|
 | KMP | 精确后缀匹配，找到就准，找不到就不猜 | 高重复文本（代码模板、结构化输出） |
 | Hash | 全局频率 argmax 链式推理，总能猜但常猜错 | 跨请求持久化积累统计 |
-| Trie | 复现 LookaheadCache，output-only 模式需充分预热 | 长期服务、多轮对话（output 模式持续积累） |
+| Trie | 复现 LookaheadCache，mix 模式 1:1 加权，2 token 上下文 | 长期服务、多轮对话（历史持续积累） |
 | Suffix | 后缀树 + 概率过滤 + 动态长度，只出高置信 draft | **通用场景最优**，单请求即可发挥 |
