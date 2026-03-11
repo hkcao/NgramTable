@@ -94,12 +94,14 @@ def _run_single_seq(
     num_warmup: int,
     result_queue: mp.Queue,
     use_trie: bool = False,
+    trie_node_size: int = 1,
 ):
     import torch as _torch
 
     # Set the mode switch env vars BEFORE importing vllm
     os.environ["VLLM_NGRAM_USE_HASH"] = "1" if use_hash else "0"
     os.environ["VLLM_NGRAM_USE_TRIE"] = "1" if use_trie else "0"
+    os.environ["VLLM_TRIE_NODE_SIZE"] = str(trie_node_size)
 
     from vllm import LLM, SamplingParams
     from vllm.v1.metrics.reader import Counter as MCounter
@@ -249,13 +251,15 @@ def _run_single_seq(
 
 def run_config_in_subprocess(prompt_texts, model_name, gpu_mem, max_tokens,
                              spec_config, mode_name, use_hash=False,
-                             num_warmup=2, use_trie=False):
+                             num_warmup=2, use_trie=False,
+                             trie_node_size=1):
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
     p = ctx.Process(
         target=_run_single_seq,
         args=(prompt_texts, model_name, gpu_mem, max_tokens,
-              spec_config, mode_name, use_hash, num_warmup, q, use_trie),
+              spec_config, mode_name, use_hash, num_warmup, q, use_trie,
+              trie_node_size),
     )
     p.start()
     p.join(timeout=1200)
@@ -283,8 +287,8 @@ def run_benchmark(model_name, num_samples, max_tokens, ngram_configs,
 
     prompt_texts = build_swe_prompts(num_samples, max_prompt_len)
     all_results = []
-    # baseline + 3 ngram modes per config + 1 suffix per config
-    total_runs = 1 + len(ngram_configs) * 4
+    # baseline + KMP + Hash + Trie + Trie-2g + Trie-3g + Suffix per config
+    total_runs = 1 + len(ngram_configs) * 6
     run_idx = 0
 
     # 1. Baseline (no speculative decoding)
@@ -332,14 +336,38 @@ def run_benchmark(model_name, num_samples, max_tokens, ngram_configs,
         all_results.append(r)
         time.sleep(2)
 
-        # Trie mode
+        # Trie mode (node_size=1, original)
         run_idx += 1
         label_trie = f"Trie {tag}"
         print(f"\n>>> [{run_idx}/{total_runs}] {label_trie} ...")
         r = run_config_in_subprocess(
             prompt_texts, model_name, gpu_mem, max_tokens,
             spec_config=spec_config, mode_name=label_trie,
-            use_hash=False, use_trie=True,
+            use_hash=False, use_trie=True, trie_node_size=1,
+        )
+        all_results.append(r)
+        time.sleep(2)
+
+        # Trie mode (node_size=2)
+        run_idx += 1
+        label_trie2 = f"Trie-2g {tag}"
+        print(f"\n>>> [{run_idx}/{total_runs}] {label_trie2} ...")
+        r = run_config_in_subprocess(
+            prompt_texts, model_name, gpu_mem, max_tokens,
+            spec_config=spec_config, mode_name=label_trie2,
+            use_hash=False, use_trie=True, trie_node_size=2,
+        )
+        all_results.append(r)
+        time.sleep(2)
+
+        # Trie mode (node_size=3)
+        run_idx += 1
+        label_trie3 = f"Trie-3g {tag}"
+        print(f"\n>>> [{run_idx}/{total_runs}] {label_trie3} ...")
+        r = run_config_in_subprocess(
+            prompt_texts, model_name, gpu_mem, max_tokens,
+            spec_config=spec_config, mode_name=label_trie3,
+            use_hash=False, use_trie=True, trie_node_size=3,
         )
         all_results.append(r)
         time.sleep(2)
@@ -397,22 +425,33 @@ def run_benchmark(model_name, num_samples, max_tokens, ngram_configs,
               f"{lat_ratio:>8.2f}x "
               f"{acc:>8} {mlen:>8}")
 
-    # Pairwise comparison: KMP vs Hash vs Trie vs Suffix
+    # Pairwise comparison
     print("\n" + "=" * 100)
-    print("KMP vs Hash vs Trie vs Suffix Pairwise Comparison")
+    print("Pairwise Comparison")
     print("=" * 100)
     kmp_results = {r["mode"]: r for r in valid if r["mode"].startswith("KMP")}
     ht_results = {r["mode"]: r for r in valid if r["mode"].startswith("Hash")}
-    trie_results = {r["mode"]: r for r in valid if r["mode"].startswith("Trie")}
+    # Trie (node_size=1) starts with "Trie " but NOT "Trie-"
+    trie_results = {r["mode"]: r for r in valid
+                    if r["mode"].startswith("Trie ")
+                    and not r["mode"].startswith("Trie-")}
+    trie2_results = {r["mode"]: r for r in valid
+                     if r["mode"].startswith("Trie-2g")}
+    trie3_results = {r["mode"]: r for r in valid
+                     if r["mode"].startswith("Trie-3g")}
     suffix_results = {r["mode"]: r for r in valid
                       if r["mode"].startswith("Suffix")}
 
     for kmp_name, kmp_r in kmp_results.items():
         ht_name = kmp_name.replace("KMP", "Hash")
         trie_name = kmp_name.replace("KMP", "Trie")
+        trie2_name = kmp_name.replace("KMP", "Trie-2g")
+        trie3_name = kmp_name.replace("KMP", "Trie-3g")
         suffix_name = kmp_name.replace("KMP", "Suffix")
         ht_r = ht_results.get(ht_name)
         trie_r = trie_results.get(trie_name)
+        trie2_r = trie2_results.get(trie2_name)
+        trie3_r = trie3_results.get(trie3_name)
         suffix_r = suffix_results.get(suffix_name)
         tag = kmp_name.replace("KMP ", "")
 
@@ -423,6 +462,10 @@ def run_benchmark(model_name, num_samples, max_tokens, ngram_configs,
             entries.append(("Hash", ht_r))
         if trie_r:
             entries.append(("Trie", trie_r))
+        if trie2_r:
+            entries.append(("Trie-2g", trie2_r))
+        if trie3_r:
+            entries.append(("Trie-3g", trie3_r))
         if suffix_r:
             entries.append(("Suffix", suffix_r))
 
@@ -433,7 +476,7 @@ def run_benchmark(model_name, num_samples, max_tokens, ngram_configs,
                    .get("acceptance_rate_pct", 0))
             mlen = (r.get("acceptance_stats", {})
                     .get("mean_accepted_length", 0))
-            print(f"    {label:<8}: avg_lat={avg:.3f}s  "
+            print(f"    {label:<10}: avg_lat={avg:.3f}s  "
                   f"tps={tps:.1f}  accept={acc:.1f}%  "
                   f"mean_len={mlen:.2f}")
 

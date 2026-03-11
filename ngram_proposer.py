@@ -55,16 +55,22 @@ class TrieTree:
     """A per-root-token Trie managing successor sequences.
 
     Corresponds to LookaheadCache.Tree.
+
+    When ``ins`` (internal node size) > 1, each internal edge label is a
+    tuple of ``ins`` tokens.  Matching consumes ``ins`` tokens per level.
+    Remainder tokens (< ins) at sequence tails are stored as shorter
+    tuples to avoid information loss.
     """
 
     def __init__(self, token_id: int, max_node: int = 65536,
-                 max_output_node: int = 512):
+                 max_output_node: int = 512, ins: int = 1):
         self.token_id = token_id
         self.max_node = max_node
         self.max_output_node = max_output_node
+        self.ins = ins  # internal node size
         self.n_node = 0
         self.n_output_node = 0
-        self.nodes: dict[int, TrieNode] = {}
+        self.nodes: dict = {}
 
     # ---- write path ----
 
@@ -75,47 +81,83 @@ class TrieTree:
             idx = -1
         self._put(token_ids, self.nodes, mode=mode, idx=idx, freq=freq)
 
+    def _make_key(self, token_ids: list[int], pos: int) -> tuple:
+        """Make a node key from pos.  Returns (key, advance_count).
+        For ins=1: key is int, advance 1.
+        For ins>1: key is tuple of min(ins, remaining) tokens."""
+        ins = self.ins
+        if ins == 1:
+            return token_ids[pos], 1
+        remaining = len(token_ids) - pos
+        width = min(ins, remaining)
+        if width == 1:
+            return token_ids[pos], 1
+        return tuple(token_ids[pos:pos + width]), width
+
     def _put(self, token_ids: list[int], nodes: dict, mode: str = 'output',
              freq: float = 1.0, idx: int = -1):
-        while True:
-            if len(token_ids) == 0:
-                break
-            t = token_ids[0]
-            node = nodes.get(t, None)
+        pos = 0
+        while pos < len(token_ids):
+            key, width = self._make_key(token_ids, pos)
+            node = nodes.get(key, None)
             if node is None:
-                n = self._pack(token_ids, idx, freq=freq)
+                n = self._pack(token_ids, pos, idx, freq=freq)
                 nodes.update(n)
-                self.n_node += len(token_ids)
+                # count remaining chunks
+                p = pos
+                cnt = 0
+                while p < len(token_ids):
+                    _, w = self._make_key(token_ids, p)
+                    p += w
+                    cnt += 1
+                self.n_node += cnt
                 if mode == 'output':
-                    self.n_output_node += len(token_ids)
+                    self.n_output_node += cnt
                 break
             node.freqs[idx] = node.freqs.get(idx, 0.0) + freq
             nodes = node.children
-            token_ids = token_ids[1:]
+            pos += width
 
-    def _pack(self, token_ids: list[int], idx: int,
+    def _pack(self, token_ids: list[int], start: int, idx: int,
               freq: float = 1.0) -> dict:
+        """Build a chain of new nodes for token_ids[start:]."""
+        # Collect keys from start to end
+        keys = []
+        p = start
+        while p < len(token_ids):
+            key, width = self._make_key(token_ids, p)
+            keys.append(key)
+            p += width
+        # Build chain backwards
         ps: dict = {}
-        for token in token_ids[::-1]:
+        for key in keys[::-1]:
             freqs = {idx: freq}
             p = TrieNode(ps, freqs)
-            ps = {token: p}
+            ps = {key: p}
         return ps
 
     # ---- read path ----
 
     def _match(self, token_ids: list[int], mode: str = 'mix',
                idx: int = 0) -> tuple:
+        """Walk token_ids through the tree.  Returns (last_token, children).
+        last_token is the last individual token of the deepest matched chunk.
+        """
+        ins = self.ins
         nodes = self.nodes
         token_id = None
         if len(token_ids) == 0:
             return token_id, nodes
 
-        for token_id in token_ids:
-            node = nodes.get(token_id, None)
+        pos = 0
+        while pos < len(token_ids):
+            key, width = self._make_key(token_ids, pos)
+            node = nodes.get(key, None)
             nodes = {}
             if node is None:
+                token_id = token_ids[pos + width - 1]
                 break
+            token_id = token_ids[pos + width - 1]
             if mode == 'input':
                 if node.freqs.get(idx, 0.0) > 0:
                     nodes = node.children
@@ -125,6 +167,7 @@ class TrieTree:
             else:
                 if node.freqs.get(idx, 0.0) > 0 or node.freqs.get(-1, 0.0) > 0:
                     nodes = node.children
+            pos += width
 
         return token_id, nodes
 
@@ -266,12 +309,27 @@ class TrieTree:
                 sizes[0] += 1
             if fo > 0.0:
                 sizes[1] += 1
-            ids.append(tid)
-            rid = len(ids) - 1
 
-            if pid > -1:
-                mask[rid] = mask[pid]
-            mask[rid, rid] = 1
+            # Expand n-gram tuple keys to individual tokens
+            if isinstance(tid, tuple):
+                prev = pid
+                for t in tid:
+                    if len(ids) >= max_size:
+                        return
+                    ids.append(t)
+                    rid = len(ids) - 1
+                    if prev > -1:
+                        mask[rid] = mask[prev]
+                    mask[rid, rid] = 1
+                    prev = rid
+                rid = prev
+            else:
+                ids.append(tid)
+                rid = len(ids) - 1
+                if pid > -1:
+                    mask[rid] = mask[pid]
+                mask[rid, rid] = 1
+
             if len(node.children) > 0:
                 self._ravel(node.children, ids, mask, rid,
                             max_size=max_size,
@@ -332,9 +390,14 @@ class TrieTree:
                             max_id = t
             if max_node is None:
                 break
-            ids.append(max_id)
+            # Expand n-gram tuple keys to individual tokens
+            if isinstance(max_id, tuple):
+                ids.extend(max_id)
+                length += len(max_id)
+            else:
+                ids.append(max_id)
+                length += 1
             nodes = max_node.children
-            length += 1
 
         return (ids,
                 np.tril(np.ones((length + 1, length + 1), dtype=np.int64),
@@ -388,14 +451,20 @@ class TrieTree:
 class TrieCache:
     """Top-level Trie cache, corresponding to LookaheadCache.
 
-    ``mem`` maps each root token_id to a TrieTree that stores all
-    successor sequences starting with that token.
+    ``mem`` maps each root key to a TrieTree that stores all
+    successor sequences starting with that key.
+
+    When ``node_size`` > 1, root keys are tuples of ``node_size``
+    tokens.
     """
 
-    def __init__(self, max_node: int = 65536, max_output_node: int = 512):
+    def __init__(self, max_node: int = 65536, max_output_node: int = 512,
+                 node_size: int = 1, internal_node_size: int = 1):
         self.max_node = max_node
         self.max_output_node = max_output_node
-        self.mem: dict[int, TrieTree] = {}
+        self.node_size = node_size
+        self.internal_node_size = internal_node_size
+        self.mem: dict = {}  # key: int (node_size=1) or tuple
         self._output_ids: defaultdict[int, list] = defaultdict(list)
         self._update_trees: set[TrieTree] = set()
         self._update_input_trees: set[TrieTree] = set()
@@ -404,21 +473,25 @@ class TrieCache:
 
     def put(self, token_ids: list[int], branch_length: int = 8,
             mode: str = 'output', idx: int = 0):
-        if len(token_ids) < 2:
+        ns = self.node_size
+        if len(token_ids) < ns + 1:
             return
         ts = len(token_ids)
-        for i in range(ts - 1):
-            token_id = token_ids[i]
-            tup = token_ids[i + 1:i + branch_length + 1]
-            tree = self.mem.get(token_id, None)
+        for i in range(ts - ns + 1):
+            root_key = token_ids[i] if ns == 1 else tuple(token_ids[i:i + ns])
+            tup = token_ids[i + ns:i + ns + branch_length]
+            tree = self.mem.get(root_key, None)
             if tree is not None:
                 tree.put(tup, mode=mode, idx=idx)
                 self._update_trees.add(tree)
             else:
-                tree = TrieTree(token_id, max_node=self.max_node,
-                                max_output_node=self.max_output_node)
+                # token_id = last token of root n-gram (anchor for ids[0])
+                tid = root_key if ns == 1 else root_key[-1]
+                tree = TrieTree(tid, max_node=self.max_node,
+                                max_output_node=self.max_output_node,
+                                ins=self.internal_node_size)
                 tree.put(tup, mode=mode, idx=idx)
-                self.mem[token_id] = tree
+                self.mem[root_key] = tree
             if mode == 'input':
                 self._update_input_trees.add(tree)
 
@@ -426,22 +499,28 @@ class TrieCache:
 
     def stream_put(self, token_ids: list[int], branch_length: int = 8,
                    final: bool = False, idx: int = 0):
+        ns = self.node_size
         self._output_ids[idx].extend(token_ids)
         output_ids = self._output_ids[idx]
         ts = len(output_ids)
         min_branch_length = 1 if final else branch_length
         if ts > min_branch_length:
             for i in range(ts - min_branch_length):
-                token_id = output_ids[i]
-                tup = output_ids[i + 1:i + branch_length + 1]
-                tree = self.mem.get(token_id, None)
+                if i + ns > ts:
+                    break
+                root_key = output_ids[i] if ns == 1 \
+                    else tuple(output_ids[i:i + ns])
+                tup = output_ids[i + ns:i + ns + branch_length]
+                tree = self.mem.get(root_key, None)
                 if tree is not None:
                     tree.put(tup, mode='output', idx=idx)
                 else:
-                    tree = TrieTree(token_id, max_node=self.max_node,
-                                    max_output_node=self.max_output_node)
+                    tid = root_key if ns == 1 else root_key[-1]
+                    tree = TrieTree(tid, max_node=self.max_node,
+                                    max_output_node=self.max_output_node,
+                                    ins=self.internal_node_size)
                     tree.put(tup, mode='output', idx=idx)
-                    self.mem[token_id] = tree
+                    self.mem[root_key] = tree
                 self._update_trees.add(tree)
             if not final:
                 self._output_ids[idx] = output_ids[ts - branch_length:]
@@ -463,13 +542,16 @@ class TrieCache:
         if decoding_length <= 1 or branch_length == 0:
             return token_ids[-1:], default_mask, []
 
+        ns = self.node_size
         decoding_ids = None
         decoding_masks = default_mask
         sizes = [0, 0]
-        for i, t in enumerate(token_ids):
-            tree = self.mem.get(t, None)
+        for i in range(len(token_ids) - ns + 1):
+            root_key = token_ids[i] if ns == 1 \
+                else tuple(token_ids[i:i + ns])
+            tree = self.mem.get(root_key, None)
             if tree is not None:
-                ids = token_ids[i + 1:]
+                ids = token_ids[i + ns:]
                 decoding_ids, decoding_masks, sizes = tree.get(
                     ids,
                     max_size=decoding_length,
@@ -498,13 +580,16 @@ class TrieCache:
         if decoding_length <= 1 or branch_length == 0:
             return token_ids[-1:], default_mask, []
 
+        ns = self.node_size
         decoding_ids = None
         decoding_masks = default_mask
         sizes = [0, 0]
-        for i, t in enumerate(token_ids):
-            tree = self.mem.get(t, None)
+        for i in range(len(token_ids) - ns + 1):
+            root_key = token_ids[i] if ns == 1 \
+                else tuple(token_ids[i:i + ns])
+            tree = self.mem.get(root_key, None)
             if tree is not None:
-                ids = token_ids[i + 1:]
+                ids = token_ids[i + ns:]
                 decoding_ids, decoding_masks, sizes = \
                     tree.get_one_branch(
                         ids,
@@ -647,6 +732,10 @@ class NgramProposer:
             "VLLM_TRIE_BRANCH_LENGTH", "8"))
         self._trie_decoding_length: int = int(os.environ.get(
             "VLLM_TRIE_DECODING_LENGTH", "64"))
+        self._trie_node_size: int = int(os.environ.get(
+            "VLLM_TRIE_NODE_SIZE", "1"))
+        self._trie_internal_node_size: int = int(os.environ.get(
+            "VLLM_TRIE_INTERNAL_NODE_SIZE", "1"))
         self._trie_cache: Optional[TrieCache] = None
         self._trie_req_last_num_tokens: dict[int, int] = {}
         self._trie_persist_lock = threading.Lock()
@@ -1090,12 +1179,15 @@ class NgramProposer:
 
     def _trie_init(self) -> None:
         """Initialize TrieCache, loading from disk if available."""
+        ns = self._trie_node_size
+        ins = self._trie_internal_node_size
         if self.trie_table_path and os.path.exists(self.trie_table_path):
             try:
                 with open(self.trie_table_path, "rb") as f:
                     mem = pickle.load(f)
                 self._trie_cache = TrieCache(
-                    max_node=65536, max_output_node=512)
+                    max_node=65536, max_output_node=512,
+                    node_size=ns, internal_node_size=ins)
                 self._trie_cache.mem = mem
                 logger.info(
                     "Loaded trieTable from %s: %d root entries",
@@ -1105,7 +1197,12 @@ class NgramProposer:
                 logger.warning(
                     "Failed to load trieTable from %s, starting fresh",
                     self.trie_table_path, exc_info=True)
-        self._trie_cache = TrieCache(max_node=65536, max_output_node=512)
+        self._trie_cache = TrieCache(
+            max_node=65536, max_output_node=512,
+            node_size=ns, internal_node_size=ins)
+        if ns > 1 or ins > 1:
+            logger.info("Trie root_node_size=%d, internal_node_size=%d",
+                        ns, ins)
 
     def _trie_persist_sync(self) -> None:
         """Synchronously persist TrieCache.mem to disk."""
@@ -1179,7 +1276,12 @@ class NgramProposer:
             # Original LookaheadCache callers pass only 2 tokens near
             # the decoding cursor (token before cursor + cursor token),
             # NOT the full sequence.  Match that convention.
-            context = tokens[-2:] if len(tokens) >= 2 else tokens
+            # With node_size > 1, we need more context: ns (root) + ns
+            # (at least one internal match step).
+            ns = self._trie_node_size
+            ins = self._trie_internal_node_size
+            ctx_len = max(2, ns + ins * 2)
+            context = tokens[-ctx_len:] if len(tokens) >= ctx_len else tokens
             bl = min(k, branch_length)
             dl = self._trie_decoding_length
             min_output_size = max(dl // 2, 1)
