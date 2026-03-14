@@ -30,6 +30,13 @@ _USE_HASH_ENV = "VLLM_NGRAM_USE_HASH"
 # ---------------------------------------------------------------------------
 _USE_TRIE_ENV = "VLLM_NGRAM_USE_TRIE"
 
+# ---------------------------------------------------------------------------
+# Environment variable to switch to Python Suffix mode.
+#   VLLM_NGRAM_USE_PYSUFFIX="1"  -> Python suffix mode (overrides trie/hash)
+#   VLLM_NGRAM_USE_PYSUFFIX="0"  -> disabled (default)
+# ---------------------------------------------------------------------------
+_USE_PYSUFFIX_ENV = "VLLM_NGRAM_USE_PYSUFFIX"
+
 # Persistence flush threshold: flush ngramTable every N update steps
 _FLUSH_EVERY = 100
 
@@ -658,6 +665,457 @@ class TrieCache:
             self._update_trees.clear()
 
 
+# ======================================================================
+# Python Suffix: pure-Python suffix trie with n-gram root keys
+# ======================================================================
+
+
+class SuffixNode:
+    """Lightweight node for the Python suffix trie."""
+    __slots__ = ['count', 'children']
+
+    def __init__(self):
+        self.count: int = 0
+        self.children: dict[int, 'SuffixNode'] = {}
+
+
+class SuffixTrie:
+    """Per-root-key suffix trie with count-based greedy speculation.
+
+    Stores all suffixes that share the same n-gram root key.
+    Speculation follows the highest-count child at each step,
+    with probability filtering (child.count / parent.count >= min_prob).
+    """
+
+    def __init__(self, max_depth: int = 64):
+        self.max_depth = max_depth
+        self.root = SuffixNode()
+        self.n_node = 0
+
+    def insert(self, tokens: list[int]):
+        """Insert a token sequence, incrementing counts along the path."""
+        node = self.root
+        for tok in tokens[:self.max_depth]:
+            node.count += 1
+            child = node.children.get(tok)
+            if child is None:
+                child = SuffixNode()
+                node.children[tok] = child
+                self.n_node += 1
+            node = child
+        node.count += 1
+
+    def extend(self, existing_context: list[int], new_tokens: list[int]):
+        """Extend an existing suffix path with new tokens.
+
+        Walks existing_context WITHOUT incrementing counts (already counted),
+        then adds new_tokens. The junction node (last node of existing path)
+        is NOT re-counted — the suffix was already counted during insert.
+        Only genuinely new nodes get count=1.
+
+        This matches C++ SuffixTree::append Case 1a/1b: when extending an
+        active suffix to a new child, the parent's count does NOT change.
+        """
+        node = self.root
+        # Walk existing path without counting
+        for tok in existing_context[:self.max_depth]:
+            child = node.children.get(tok)
+            if child is None:
+                return  # path was truncated or doesn't exist
+            node = child
+
+        # Add new tokens — don't re-count junction node.
+        # In C++, extending a suffix into a NEW child (Case 1) does not
+        # increment the parent's count. Only transitioning into an EXISTING
+        # child (Case 3) increments its count.
+        remaining_depth = self.max_depth - len(existing_context)
+        for tok in new_tokens[:remaining_depth]:
+            child = node.children.get(tok)
+            if child is None:
+                child = SuffixNode()
+                child.count = 1  # new node: 1 suffix reaches it
+                node.children[tok] = child
+                self.n_node += 1
+            else:
+                # Existing child: one more suffix enters (C++ Case 3)
+                child.count += 1
+            node = child
+
+    def speculate(self, context: list[int], max_tokens: int = 5,
+                  min_prob: float = 0.1) -> tuple[list[int], float, bool]:
+        """Full-match context then greedily follow highest-count path.
+
+        Returns (draft_token_ids, score, matched).
+        matched=False means the context walk failed (some token not in tree).
+        Score is the sum of estimated probabilities at each step.
+        """
+        # Walk context - FULL match required (like C++ _match_context)
+        node = self.root
+        for tok in context:
+            child = node.children.get(tok)
+            if child is None:
+                return [], 0.0, False
+            node = child
+
+        # Greedy speculation with cumulative probability filter
+        # Matches C++ _speculate_path: prob is cumulative product,
+        # checked before each emission, score = sum of cumulative probs.
+        # Uses float32 to match C++ float precision.
+        drafts: list[int] = []
+        score: float = 0.0
+        prob = np.float32(1.0)  # cumulative probability (C++ uses float)
+        min_prob_f32 = np.float32(min_prob)
+        ties: list[tuple] = []  # debug: record tie-breaking events
+        for step in range(max_tokens):
+            if not node.children:
+                break
+            best_tok = -1
+            best_count = 0
+            tied_toks: list[int] = []  # debug
+            for tok, child in node.children.items():
+                if child.count > best_count:
+                    best_count = child.count
+                    best_tok = tok
+                    tied_toks = [tok]  # debug: reset
+                elif child.count == best_count and best_count > 0:
+                    tied_toks.append(tok)  # debug: track ties
+            if len(tied_toks) > 1:
+                ties.append((step, best_tok, tied_toks, best_count))
+            # Cumulative probability (matches C++ _speculate_path)
+            prob *= np.float32(best_count) / np.float32(node.count) \
+                if node.count > 0 else np.float32(0.0)
+            if prob < min_prob_f32:
+                break
+            score += float(prob)
+            drafts.append(best_tok)
+            node = node.children[best_tok]
+
+        return drafts, score, True, ties
+
+    def squeeze(self, decay: float = 0.5, min_count: int = 1):
+        """Decay counts and prune low-count nodes."""
+        self._squeeze(self.root, decay, min_count)
+
+    def _squeeze(self, node: SuffixNode, decay: float, min_count: int):
+        for tok in list(node.children.keys()):
+            child = node.children[tok]
+            child.count = int(child.count * decay)
+            if child.count < min_count and not child.children:
+                del node.children[tok]
+                self.n_node -= 1
+            elif child.children:
+                self._squeeze(child, decay, min_count)
+
+
+class SuffixCache:
+    """N-gram root key cache for Python Suffix tries.
+
+    Dual-tree architecture matching C++ SuffixDecodingCache:
+      - **Local trees**: per-request, store prompt + generated tokens.
+        Used for intra-request pattern matching.
+      - **Global trees**: shared across all requests, store completed
+        responses.  Used for cross-request pattern reuse.
+
+    Each tree layer maps root keys (single token or N-token tuple)
+    to a SuffixTrie that stores all continuations.
+    """
+
+    def __init__(self, root_ns: int = 1, max_depth: int = 24,
+                 max_nodes_per_tree: int = 65536,
+                 max_spec_factor: float = 1.0,
+                 min_match_len: int = 0):
+        self.root_ns = root_ns
+        self.max_depth = max_depth
+        self.max_nodes_per_tree = max_nodes_per_tree
+        self.max_spec_factor = max_spec_factor
+        self.min_match_len = min_match_len
+        # Global trees: persist across requests, store responses only
+        self._global: dict = {}  # root_key -> SuffixTrie
+        # Local trees: per-request (prompt + generated)
+        self._locals: dict[int, dict] = {}  # idx -> {root_key -> SuffixTrie}
+        # Full token buffer per request (prompt + generated, for local)
+        self._req_tokens: dict[int, list] = {}
+        # Response-only buffer per request (for global)
+        self._req_response: dict[int, list] = {}
+        # Trailing root key tracking: C++ increments node count even for
+        # the last token (which has no continuation), Python doesn't.
+        # We bump the trie root.count for the trailing key and un-bump it
+        # when the next token arrives (before the insert naturally counts it).
+        self._local_trail: dict[int, tuple] = {}  # idx -> (root_key,) or None
+        self._global_trail: dict[int, tuple] = {}  # idx -> (root_key,) or None
+        # Debug logging
+        self._debug_fp = None
+        self._debug_step = 0
+        if os.environ.get("VLLM_PYSUFFIX_DEBUG") == "1":
+            self._debug_fp = open("/tmp/pysuffix_debug.log", "w")
+            logger.info("PySuffix debug log: /tmp/pysuffix_debug.log")
+
+    # ---- request lifecycle ----
+
+    def start_request(self, idx: int, prompt_tokens: list[int]):
+        """Build local trees from prompt tokens."""
+        local: dict = {}
+        self._insert_suffixes(local, prompt_tokens)
+        self._locals[idx] = local
+        self._req_tokens[idx] = list(prompt_tokens)
+        self._req_response[idx] = []
+        # Bump trailing count for last prompt token (C++ counts it)
+        self._local_trail[idx] = self._bump_trail(
+            local, prompt_tokens, self.root_ns)
+        self._global_trail[idx] = None  # no response yet
+
+    def add_tokens(self, idx: int, new_tokens: list[int]):
+        """Add generated tokens to both local and global trees.
+
+        Local tree: stores prompt + all generated (full context).
+        Global tree: stores response tokens only (cross-request reuse).
+        """
+        n_new = len(new_tokens)
+        # Un-bump previous trailing counts (the insert will naturally count them)
+        self._unbump_trail(self._locals.get(idx, {}),
+                           self._local_trail.get(idx))
+        self._unbump_trail(self._global, self._global_trail.get(idx))
+        # Update local: full sequence (prompt + generated)
+        self._req_tokens[idx].extend(new_tokens)
+        self._insert_suffixes_incremental(
+            self._locals[idx], self._req_tokens[idx], n_new)
+        # Update global: response tokens only
+        self._req_response[idx].extend(new_tokens)
+        self._insert_suffixes_incremental(
+            self._global, self._req_response[idx], n_new)
+        # Bump trailing counts for new last tokens
+        ns = self.root_ns
+        self._local_trail[idx] = self._bump_trail(
+            self._locals[idx], self._req_tokens[idx], ns)
+        self._global_trail[idx] = self._bump_trail(
+            self._global, self._req_response[idx], ns)
+
+    def stop_request(self, idx: int):
+        """Clean up local trees. Global trees persist."""
+        # Un-bump global trailing count before removing request
+        self._unbump_trail(self._global, self._global_trail.get(idx))
+        self._locals.pop(idx, None)
+        self._req_tokens.pop(idx, None)
+        self._req_response.pop(idx, None)
+        self._local_trail.pop(idx, None)
+        self._global_trail.pop(idx, None)
+
+    def _bump_trail(self, trees: dict, token_ids: list[int],
+                    ns: int) -> tuple | None:
+        """Bump root.count for the trailing root key.
+
+        C++ SuffixTree::append() increments _root->count for every suffix
+        position, including the last one where there's no continuation.
+        Python's _insert_suffixes skips that position. This method adds
+        the missing count so the trie root.count matches C++.
+
+        Returns (root_key,) for later un-bumping, or None if nothing bumped.
+        """
+        ts = len(token_ids)
+        if ts < ns:
+            return None
+        # The trailing position is ts - ns (last valid root key position)
+        root_key = self._make_key(token_ids, ts - ns)
+        tree = trees.get(root_key)
+        if tree is not None:
+            tree.root.count += 1
+            return (root_key,)
+        else:
+            # Tree doesn't exist yet — create it with just a root count bump
+            tree = SuffixTrie(self.max_depth)
+            tree.root.count = 1
+            trees[root_key] = tree
+            return (root_key,)
+
+    def _unbump_trail(self, trees: dict, trail_info: tuple | None):
+        """Undo a previous _bump_trail (decrement root.count)."""
+        if trail_info is None:
+            return
+        root_key = trail_info[0]
+        tree = trees.get(root_key)
+        if tree is not None:
+            tree.root.count -= 1
+
+    # ---- speculation ----
+
+    def speculate(self, idx: int, context: list[int],
+                  max_tokens: int = 5,
+                  min_prob: float = 0.1) -> list[int]:
+        """Speculate using both local and global trees.
+
+        Picks the draft with the higher score (sum of probabilities),
+        matching C++ SuffixDecodingCache semantics.
+        """
+        msf = self.max_spec_factor
+        local_draft, local_score, local_ties = self._speculate_from(
+            self._locals.get(idx, {}), context, max_tokens, min_prob, msf)
+        global_draft, global_score, global_ties = self._speculate_from(
+            self._global, context, max_tokens, min_prob, msf)
+        if local_score >= global_score:
+            chosen_draft = local_draft
+            chosen_ties = local_ties
+            source = "local"
+        else:
+            chosen_draft = global_draft
+            chosen_ties = global_ties
+            source = "global"
+        # Debug logging (env VLLM_PYSUFFIX_DEBUG=1)
+        if self._debug_fp is not None and chosen_draft:
+            self._debug_step += 1
+            tie_info = ""
+            if chosen_ties:
+                tie_info = " TIES:" + str(chosen_ties)
+            self._debug_fp.write(
+                f"step={self._debug_step} idx={idx} src={source} "
+                f"ctx_tail={context[-3:]} draft={chosen_draft}"
+                f" L={local_draft}({local_score:.4f})"
+                f" G={global_draft}({global_score:.4f})"
+                f"{tie_info}\n")
+            self._debug_fp.flush()
+        return chosen_draft
+
+    # ---- internal helpers ----
+
+    def _make_key(self, token_ids: list[int], pos: int):
+        ns = self.root_ns
+        if ns == 1:
+            return token_ids[pos]
+        return tuple(token_ids[pos:pos + ns])
+
+    def _insert_suffixes(self, trees: dict, token_ids: list[int]):
+        """Insert all suffixes from a full token sequence."""
+        ns = self.root_ns
+        depth = self.max_depth
+        ts = len(token_ids)
+        if ts <= ns:
+            return
+        for i in range(ts - ns):
+            root_key = self._make_key(token_ids, i)
+            end = min(i + ns + depth, ts)
+            subsequent = token_ids[i + ns:end]
+            if not subsequent:
+                continue
+            tree = trees.get(root_key)
+            if tree is None:
+                tree = SuffixTrie(depth)
+                trees[root_key] = tree
+            tree.insert(subsequent)
+
+    def _insert_suffixes_incremental(self, trees: dict,
+                                     all_tokens: list[int],
+                                     n_new: int):
+        """Insert only suffixes that include at least one new token.
+
+        For existing suffixes (root in old tokens): use extend() to walk
+        existing path without re-counting, then insert only new tokens.
+        For new suffixes (root in new tokens): full insert.
+        This matches C++ SuffixTree's incremental extend via active_nodes.
+        """
+        ns = self.root_ns
+        depth = self.max_depth
+        ts = len(all_tokens)
+        old_ts = ts - n_new
+        if ts <= ns:
+            return
+        # Earliest start where the suffix window (up to depth) touches new tokens
+        start = max(0, ts - n_new - ns - depth + 1)
+        for i in range(start, ts - ns):
+            root_key = self._make_key(all_tokens, i)
+            end = min(i + ns + depth, ts)
+
+            if i + ns < old_ts:
+                # Existing suffix: extend with new tokens only (no re-counting)
+                tree = trees.get(root_key)
+                if tree is None:
+                    continue  # tree should exist from prior insert
+                existing = all_tokens[i + ns:old_ts]
+                new_part = all_tokens[old_ts:end]
+                if not new_part:
+                    continue
+                tree.extend(existing, new_part)
+            else:
+                # New suffix: full insert
+                subsequent = all_tokens[i + ns:end]
+                if not subsequent:
+                    continue
+                tree = trees.get(root_key)
+                if tree is None:
+                    tree = SuffixTrie(depth)
+                    trees[root_key] = tree
+                tree.insert(subsequent)
+
+    def _speculate_from(self, trees: dict, context: list[int],
+                        max_tokens: int,
+                        min_prob: float,
+                        max_spec_factor: float = 0.0,
+                        ) -> tuple[list[int], float]:
+        """Speculate from a set of trees (local or global).
+
+        Matches C++ SuffixTree::speculate order:
+        - Iterates match_len from ns (shortest) to len(context) (longest)
+        - Takes the LAST match_len tokens of context each time
+        - Requires FULL match of remaining context in the tree
+        - Breaks on match failure (if shorter suffix fails, longer will too)
+        - Uses >= comparison so longest match wins on tie
+        - max_spec_factor: limit draft to match_len * factor (0=no limit)
+        """
+        ns = self.root_ns
+        ctx_len = len(context)
+        if ctx_len < ns:
+            return [], 0.0, []
+
+        best_draft: list[int] = []
+        best_score: float = 0.0
+        best_ties: list = []
+
+        # C++ uses match_len < context.size() (excludes full context).
+        # For ns=1 (matching C++ behavior), exclude full context length.
+        # For ns>1 (Python-only feature), allow full context.
+        upper = ctx_len if ns > 1 else ctx_len - 1
+        # min_match_len: skip short matches (like ns>1 but without
+        # changing data structure). Achieves same specificity benefit.
+        lower = max(ns, self.min_match_len) if self.min_match_len > 0 else ns
+        for match_len in range(lower, upper + 1):
+            start = ctx_len - match_len
+            root_key = self._make_key(context, start)
+            tree = trees.get(root_key)
+            if tree is None:
+                if ns == 1:
+                    break  # C++ suffix tree: short fail ⇒ long also fails
+                continue  # ns>1: independent root keys, try longer
+            remaining = context[start + ns:]
+            # Limit draft length by match_len (like C++ max_spec_factor)
+            # C++ formula: int(match_len * factor + offset + 1e-6)
+            if max_spec_factor > 0:
+                effective_max = min(max_tokens,
+                                   int(max_spec_factor * match_len + 1e-6))
+                effective_max = max(effective_max, 0)
+            else:
+                effective_max = max_tokens
+            result = tree.speculate(
+                remaining, effective_max, min_prob)
+            if len(result) == 3:
+                draft, score, matched = result
+                ties = []
+            else:
+                draft, score, matched, ties = result
+            if not matched:
+                break  # full match failed, longer matches will also fail
+            if score >= best_score:
+                best_score = score
+                best_draft = draft
+                best_ties = ties
+
+        return best_draft, best_score, best_ties
+
+    def squeeze_all(self):
+        """Prune all trees to control memory."""
+        for trees in [self._global] + list(self._locals.values()):
+            for tree in trees.values():
+                if tree.n_node > self.max_nodes_per_tree:
+                    tree.squeeze()
+
+
 class NgramProposer:
     def __init__(self, vllm_config: VllmConfig):
         assert vllm_config.speculative_config is not None
@@ -745,6 +1203,35 @@ class NgramProposer:
             # Register atexit for trie persistence
             if self.trie_table_path:
                 atexit.register(self._trie_persist_sync)
+
+        # ---- Python Suffix mode initialization ----
+        self._pysuffix_root_ns: int = int(os.environ.get(
+            "VLLM_PYSUFFIX_ROOT_NS", "1"))
+        self._pysuffix_max_depth: int = int(os.environ.get(
+            "VLLM_PYSUFFIX_MAX_DEPTH", "24"))
+        self._pysuffix_min_prob: float = float(os.environ.get(
+            "VLLM_PYSUFFIX_MIN_PROB", "0.1"))
+        self._pysuffix_max_spec_factor: float = float(os.environ.get(
+            "VLLM_PYSUFFIX_MAX_SPEC_FACTOR", "1.0"))
+        self._pysuffix_min_match_len: int = int(os.environ.get(
+            "VLLM_PYSUFFIX_MIN_MATCH_LEN", "0"))
+        self._pysuffix_cache: Optional[SuffixCache] = None
+        self._pysuffix_req_last_num_tokens: dict[int, int] = {}
+
+        if os.environ.get(_USE_PYSUFFIX_ENV, "0") == "1":
+            self._pysuffix_cache = SuffixCache(
+                root_ns=self._pysuffix_root_ns,
+                max_depth=self._pysuffix_max_depth,
+                max_spec_factor=self._pysuffix_max_spec_factor,
+                min_match_len=self._pysuffix_min_match_len)
+            logger.info("PySuffix mode: root_ns=%d, max_depth=%d, "
+                        "min_prob=%.2f, max_spec_factor=%.1f, "
+                        "min_match_len=%d",
+                        self._pysuffix_root_ns,
+                        self._pysuffix_max_depth,
+                        self._pysuffix_min_prob,
+                        self._pysuffix_max_spec_factor,
+                        self._pysuffix_min_match_len)
 
         # Trigger Numba JIT compilation for N-gram proposer (KMP warmup).
         self.propose(
@@ -1070,10 +1557,14 @@ class NgramProposer:
         | list[dict[str, torch.Tensor]]
         | None = None,  # unused
     ) -> list[list[int]]:
+        use_pysuffix = os.environ.get(_USE_PYSUFFIX_ENV, "0") == "1"
         use_trie = os.environ.get(_USE_TRIE_ENV, "0") == "1"
         use_hash = os.environ.get(_USE_HASH_ENV, "1") == "1"
 
-        if use_trie:
+        if use_pysuffix:
+            return self._propose_pysuffix_mode(
+                sampled_token_ids, num_tokens_no_spec, token_ids_cpu)
+        elif use_trie:
             return self._propose_trie_mode(
                 sampled_token_ids, num_tokens_no_spec, token_ids_cpu)
         elif use_hash:
@@ -1308,6 +1799,85 @@ class NgramProposer:
         self._trie_req_last_num_tokens.pop(idx, None)
         # Async persist
         self._trie_persist_async()
+
+    # ------------------------------------------------------------------
+    # Python Suffix mode
+    # ------------------------------------------------------------------
+
+    def _propose_pysuffix_mode(
+        self,
+        sampled_token_ids: list[list[int]],
+        num_tokens_no_spec: np.ndarray,
+        token_ids_cpu: np.ndarray,
+    ) -> list[list[int]]:
+        """Python Suffix mode: build/update suffix trie and propose drafts.
+
+        Uses dual-tree architecture (local + global) matching C++ Suffix.
+        """
+        if self._pysuffix_cache is None:
+            self._pysuffix_cache = SuffixCache(
+                root_ns=self._pysuffix_root_ns,
+                max_depth=self._pysuffix_max_depth,
+                max_spec_factor=self._pysuffix_max_spec_factor,
+                min_match_len=self._pysuffix_min_match_len)
+        cache = self._pysuffix_cache
+
+        draft_token_ids: list[list[int]] = []
+
+        for i, sampled_ids in enumerate(sampled_token_ids):
+            if not len(sampled_ids):
+                draft_token_ids.append([])
+                continue
+
+            num_tokens = int(num_tokens_no_spec[i])
+            if num_tokens >= self.max_model_len:
+                draft_token_ids.append([])
+                continue
+
+            tokens = token_ids_cpu[i, :num_tokens].tolist()
+
+            # Detect new request vs continuation
+            prev_len = self._pysuffix_req_last_num_tokens.get(i)
+            if prev_len is None or num_tokens < prev_len:
+                # New request: separate prompt from response tokens
+                # (matches C++ SuffixDecodingProposer: start_request gets
+                # prompt only, add_active_response gets response tokens
+                # which go to both local + global trees)
+                prompt_len = num_tokens - len(sampled_ids)
+                cache.start_request(i, tokens[:prompt_len])
+                if sampled_ids:
+                    cache.add_tokens(i, list(sampled_ids))
+            else:
+                # Continuation: add new generated tokens to local + global
+                n_new = num_tokens - prev_len
+                if n_new > 0:
+                    new_tokens = tokens[prev_len:]
+                    cache.add_tokens(i, new_tokens)
+
+            self._pysuffix_req_last_num_tokens[i] = num_tokens
+
+            # Query draft tokens (C++ uses max_model_len - num_tokens - 1)
+            k = min(self.k, self.max_model_len - num_tokens - 1)
+            if k <= 0:
+                draft_token_ids.append([])
+                continue
+
+            # Use up to max_depth tokens as context
+            ctx_len = min(self._pysuffix_max_depth, len(tokens))
+            context = tokens[-ctx_len:]
+            drafts = cache.speculate(
+                i, context, max_tokens=k,
+                min_prob=self._pysuffix_min_prob)
+            draft_token_ids.append(drafts[:k])
+
+        return draft_token_ids
+
+    def _pysuffix_finalize_request(self, idx: int) -> None:
+        """Called when a request finishes."""
+        if self._pysuffix_cache is None:
+            return
+        self._pysuffix_cache.stop_request(idx)
+        self._pysuffix_req_last_num_tokens.pop(idx, None)
 
     def load_model(self, *args, **kwargs):
         # No model to load.
