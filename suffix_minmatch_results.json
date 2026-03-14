@@ -8,151 +8,151 @@
       "num_prompts": 20,
       "total_input_tokens": 19066,
       "total_output_tokens": 9465,
-      "total_time": 107.374,
-      "avg_latency": 5.3687,
-      "median_latency": 5.7739,
-      "p90_latency": 5.915,
-      "output_tokens_per_second": 88.15,
+      "total_time": 108.596,
+      "avg_latency": 5.4298,
+      "median_latency": 5.8318,
+      "p90_latency": 5.9829,
+      "output_tokens_per_second": 87.16,
       "per_request": [
         {
           "idx": 0,
           "input_tokens": 400,
           "output_tokens": 512,
-          "latency": 5.7749,
-          "tokens_per_second": 88.66
+          "latency": 5.7859,
+          "tokens_per_second": 88.49
         },
         {
           "idx": 1,
           "input_tokens": 608,
           "output_tokens": 512,
-          "latency": 5.7739,
-          "tokens_per_second": 88.68
+          "latency": 5.8392,
+          "tokens_per_second": 87.68
         },
         {
           "idx": 2,
           "input_tokens": 923,
           "output_tokens": 512,
-          "latency": 5.7967,
-          "tokens_per_second": 88.33
+          "latency": 5.8678,
+          "tokens_per_second": 87.26
         },
         {
           "idx": 3,
           "input_tokens": 2268,
           "output_tokens": 512,
-          "latency": 5.915,
-          "tokens_per_second": 86.56
+          "latency": 5.9986,
+          "tokens_per_second": 85.35
         },
         {
           "idx": 4,
           "input_tokens": 289,
           "output_tokens": 512,
-          "latency": 5.7172,
-          "tokens_per_second": 89.55
+          "latency": 5.7919,
+          "tokens_per_second": 88.4
         },
         {
           "idx": 5,
           "input_tokens": 690,
           "output_tokens": 512,
-          "latency": 5.7563,
-          "tokens_per_second": 88.95
+          "latency": 5.8449,
+          "tokens_per_second": 87.6
         },
         {
           "idx": 6,
           "input_tokens": 1426,
           "output_tokens": 512,
-          "latency": 5.8518,
-          "tokens_per_second": 87.49
+          "latency": 5.9281,
+          "tokens_per_second": 86.37
         },
         {
           "idx": 7,
           "input_tokens": 1645,
           "output_tokens": 487,
-          "latency": 5.5991,
-          "tokens_per_second": 86.98
+          "latency": 5.6446,
+          "tokens_per_second": 86.28
         },
         {
           "idx": 8,
           "input_tokens": 963,
           "output_tokens": 512,
-          "latency": 5.8076,
-          "tokens_per_second": 88.16
+          "latency": 5.8916,
+          "tokens_per_second": 86.9
         },
         {
           "idx": 9,
           "input_tokens": 1942,
           "output_tokens": 512,
-          "latency": 5.8964,
-          "tokens_per_second": 86.83
+          "latency": 5.9644,
+          "tokens_per_second": 85.84
         },
         {
           "idx": 10,
           "input_tokens": 417,
           "output_tokens": 512,
-          "latency": 5.7543,
-          "tokens_per_second": 88.98
+          "latency": 5.82,
+          "tokens_per_second": 87.97
         },
         {
           "idx": 11,
           "input_tokens": 243,
           "output_tokens": 512,
-          "latency": 5.7319,
-          "tokens_per_second": 89.32
+          "latency": 5.78,
+          "tokens_per_second": 88.58
         },
         {
           "idx": 12,
           "input_tokens": 239,
           "output_tokens": 512,
-          "latency": 5.7132,
-          "tokens_per_second": 89.62
+          "latency": 5.7785,
+          "tokens_per_second": 88.6
         },
         {
           "idx": 13,
           "input_tokens": 418,
           "output_tokens": 230,
-          "latency": 2.5903,
-          "tokens_per_second": 88.79
+          "latency": 2.6257,
+          "tokens_per_second": 87.6
         },
         {
           "idx": 14,
           "input_tokens": 419,
           "output_tokens": 512,
-          "latency": 5.7504,
-          "tokens_per_second": 89.04
+          "latency": 5.8237,
+          "tokens_per_second": 87.92
         },
         {
           "idx": 15,
           "input_tokens": 1602,
           "output_tokens": 352,
-          "latency": 4.0503,
-          "tokens_per_second": 86.91
+          "latency": 4.116,
+          "tokens_per_second": 85.52
         },
         {
           "idx": 16,
           "input_tokens": 735,
           "output_tokens": 204,
-          "latency": 2.3422,
-          "tokens_per_second": 87.1
+          "latency": 2.3698,
+          "tokens_per_second": 86.08
         },
         {
           "idx": 17,
           "input_tokens": 1186,
           "output_tokens": 512,
-          "latency": 5.8285,
-          "tokens_per_second": 87.84
+          "latency": 5.9102,
+          "tokens_per_second": 86.63
         },
         {
           "idx": 18,
           "input_tokens": 2065,
           "output_tokens": 512,
-          "latency": 5.921,
-          "tokens_per_second": 86.47
+          "latency": 5.9829,
+          "tokens_per_second": 85.58
         },
         {
           "idx": 19,
           "input_tokens": 588,
           "output_tokens": 512,
-          "latency": 5.8032,
-          "tokens_per_second": 88.23
+          "latency": 5.8318,
+          "tokens_per_second": 87.79
         }
       ],
       "ngram_config": null,
@@ -163,151 +163,151 @@
       "num_prompts": 20,
       "total_input_tokens": 19066,
       "total_output_tokens": 8682,
-      "total_time": 53.213,
-      "avg_latency": 2.6606,
-      "median_latency": 2.3876,
-      "p90_latency": 4.5388,
-      "output_tokens_per_second": 163.16,
+      "total_time": 53.87,
+      "avg_latency": 2.6935,
+      "median_latency": 2.4213,
+      "p90_latency": 4.5939,
+      "output_tokens_per_second": 161.16,
       "per_request": [
         {
           "idx": 0,
           "input_tokens": 400,
           "output_tokens": 512,
-          "latency": 1.1967,
-          "tokens_per_second": 427.83
+          "latency": 1.169,
+          "tokens_per_second": 437.99
         },
         {
           "idx": 1,
           "input_tokens": 608,
           "output_tokens": 512,
-          "latency": 2.3713,
-          "tokens_per_second": 215.92
+          "latency": 2.3622,
+          "tokens_per_second": 216.75
         },
         {
           "idx": 2,
           "input_tokens": 923,
           "output_tokens": 512,
-          "latency": 1.9745,
-          "tokens_per_second": 259.31
+          "latency": 1.9949,
+          "tokens_per_second": 256.65
         },
         {
           "idx": 3,
           "input_tokens": 2268,
           "output_tokens": 512,
-          "latency": 4.5388,
-          "tokens_per_second": 112.8
+          "latency": 4.5939,
+          "tokens_per_second": 111.45
         },
         {
           "idx": 4,
           "input_tokens": 289,
           "output_tokens": 512,
-          "latency": 1.8711,
-          "tokens_per_second": 273.64
+          "latency": 1.9004,
+          "tokens_per_second": 269.42
         },
         {
           "idx": 5,
           "input_tokens": 690,
           "output_tokens": 512,
-          "latency": 2.4966,
-          "tokens_per_second": 205.08
+          "latency": 2.5242,
+          "tokens_per_second": 202.84
         },
         {
           "idx": 6,
           "input_tokens": 1426,
           "output_tokens": 512,
-          "latency": 3.424,
-          "tokens_per_second": 149.53
+          "latency": 3.4769,
+          "tokens_per_second": 147.26
         },
         {
           "idx": 7,
           "input_tokens": 1645,
           "output_tokens": 512,
-          "latency": 2.3876,
-          "tokens_per_second": 214.44
+          "latency": 2.4213,
+          "tokens_per_second": 211.46
         },
         {
           "idx": 8,
           "input_tokens": 963,
           "output_tokens": 512,
-          "latency": 3.4093,
-          "tokens_per_second": 150.18
+          "latency": 3.4391,
+          "tokens_per_second": 148.88
         },
         {
           "idx": 9,
           "input_tokens": 1942,
           "output_tokens": 512,
-          "latency": 5.9776,
-          "tokens_per_second": 85.65
+          "latency": 6.0395,
+          "tokens_per_second": 84.78
         },
         {
           "idx": 10,
           "input_tokens": 417,
           "output_tokens": 512,
-          "latency": 3.849,
-          "tokens_per_second": 133.02
+          "latency": 3.9205,
+          "tokens_per_second": 130.59
         },
         {
           "idx": 11,
           "input_tokens": 243,
           "output_tokens": 512,
-          "latency": 2.2505,
-          "tokens_per_second": 227.51
+          "latency": 2.2874,
+          "tokens_per_second": 223.84
         },
         {
           "idx": 12,
           "input_tokens": 239,
           "output_tokens": 512,
-          "latency": 2.5674,
-          "tokens_per_second": 199.42
+          "latency": 2.6009,
+          "tokens_per_second": 196.85
         },
         {
           "idx": 13,
           "input_tokens": 418,
           "output_tokens": 230,
-          "latency": 1.3001,
-          "tokens_per_second": 176.91
+          "latency": 1.3253,
+          "tokens_per_second": 173.55
         },
         {
           "idx": 14,
           "input_tokens": 419,
           "output_tokens": 183,
-          "latency": 1.5001,
-          "tokens_per_second": 121.99
+          "latency": 1.5279,
+          "tokens_per_second": 119.77
         },
         {
           "idx": 15,
           "input_tokens": 1602,
           "output_tokens": 473,
-          "latency": 3.5312,
-          "tokens_per_second": 133.95
+          "latency": 3.5991,
+          "tokens_per_second": 131.42
         },
         {
           "idx": 16,
           "input_tokens": 735,
           "output_tokens": 202,
-          "latency": 1.6268,
-          "tokens_per_second": 124.17
+          "latency": 1.6389,
+          "tokens_per_second": 123.25
         },
         {
           "idx": 17,
           "input_tokens": 1186,
           "output_tokens": 512,
-          "latency": 3.936,
-          "tokens_per_second": 130.08
+          "latency": 4.0078,
+          "tokens_per_second": 127.75
         },
         {
           "idx": 18,
           "input_tokens": 2065,
           "output_tokens": 139,
-          "latency": 1.1207,
-          "tokens_per_second": 124.03
+          "latency": 1.1338,
+          "tokens_per_second": 122.59
         },
         {
           "idx": 19,
           "input_tokens": 588,
           "output_tokens": 287,
-          "latency": 1.8835,
-          "tokens_per_second": 152.38
+          "latency": 1.9072,
+          "tokens_per_second": 150.48
         }
       ],
       "ngram_config": {
@@ -437,151 +437,151 @@
       "num_prompts": 20,
       "total_input_tokens": 19066,
       "total_output_tokens": 9556,
-      "total_time": 58.11,
-      "avg_latency": 2.9055,
-      "median_latency": 2.843,
-      "p90_latency": 4.3114,
-      "output_tokens_per_second": 164.45,
+      "total_time": 57.845,
+      "avg_latency": 2.8922,
+      "median_latency": 2.8173,
+      "p90_latency": 4.3168,
+      "output_tokens_per_second": 165.2,
       "per_request": [
         {
           "idx": 0,
           "input_tokens": 400,
           "output_tokens": 512,
-          "latency": 1.2048,
-          "tokens_per_second": 424.98
+          "latency": 1.1917,
+          "tokens_per_second": 429.65
         },
         {
           "idx": 1,
           "input_tokens": 608,
           "output_tokens": 512,
-          "latency": 2.4335,
-          "tokens_per_second": 210.4
+          "latency": 2.4209,
+          "tokens_per_second": 211.49
         },
         {
           "idx": 2,
           "input_tokens": 923,
           "output_tokens": 512,
-          "latency": 2.0329,
-          "tokens_per_second": 251.86
+          "latency": 2.0319,
+          "tokens_per_second": 251.98
         },
         {
           "idx": 3,
           "input_tokens": 2268,
           "output_tokens": 512,
-          "latency": 4.3114,
-          "tokens_per_second": 118.76
+          "latency": 4.3168,
+          "tokens_per_second": 118.61
         },
         {
           "idx": 4,
           "input_tokens": 289,
           "output_tokens": 512,
-          "latency": 1.9719,
-          "tokens_per_second": 259.65
+          "latency": 1.9744,
+          "tokens_per_second": 259.32
         },
         {
           "idx": 5,
           "input_tokens": 690,
           "output_tokens": 512,
-          "latency": 2.0013,
-          "tokens_per_second": 255.84
+          "latency": 1.9953,
+          "tokens_per_second": 256.6
         },
         {
           "idx": 6,
           "input_tokens": 1426,
           "output_tokens": 512,
-          "latency": 3.4912,
-          "tokens_per_second": 146.65
+          "latency": 3.4824,
+          "tokens_per_second": 147.02
         },
         {
           "idx": 7,
           "input_tokens": 1645,
           "output_tokens": 512,
-          "latency": 2.3524,
-          "tokens_per_second": 217.65
+          "latency": 2.3437,
+          "tokens_per_second": 218.46
         },
         {
           "idx": 8,
           "input_tokens": 963,
           "output_tokens": 512,
-          "latency": 2.692,
-          "tokens_per_second": 190.19
+          "latency": 2.6754,
+          "tokens_per_second": 191.37
         },
         {
           "idx": 9,
           "input_tokens": 1942,
           "output_tokens": 512,
-          "latency": 5.7468,
-          "tokens_per_second": 89.09
+          "latency": 5.7286,
+          "tokens_per_second": 89.38
         },
         {
           "idx": 10,
           "input_tokens": 417,
           "output_tokens": 512,
-          "latency": 4.1067,
-          "tokens_per_second": 124.68
+          "latency": 4.081,
+          "tokens_per_second": 125.46
         },
         {
           "idx": 11,
           "input_tokens": 243,
           "output_tokens": 512,
-          "latency": 2.8495,
-          "tokens_per_second": 179.68
+          "latency": 2.8294,
+          "tokens_per_second": 180.96
         },
         {
           "idx": 12,
           "input_tokens": 239,
           "output_tokens": 512,
-          "latency": 2.843,
-          "tokens_per_second": 180.09
+          "latency": 2.8173,
+          "tokens_per_second": 181.73
         },
         {
           "idx": 13,
           "input_tokens": 418,
           "output_tokens": 512,
-          "latency": 3.7622,
-          "tokens_per_second": 136.09
+          "latency": 3.7182,
+          "tokens_per_second": 137.7
         },
         {
           "idx": 14,
           "input_tokens": 419,
           "output_tokens": 177,
-          "latency": 1.6324,
-          "tokens_per_second": 108.43
+          "latency": 1.6386,
+          "tokens_per_second": 108.02
         },
         {
           "idx": 15,
           "input_tokens": 1602,
           "output_tokens": 473,
-          "latency": 3.5726,
-          "tokens_per_second": 132.4
+          "latency": 3.5277,
+          "tokens_per_second": 134.08
         },
         {
           "idx": 16,
           "input_tokens": 735,
           "output_tokens": 202,
-          "latency": 1.7815,
-          "tokens_per_second": 113.39
+          "latency": 1.7799,
+          "tokens_per_second": 113.49
         },
         {
           "idx": 17,
           "input_tokens": 1186,
           "output_tokens": 512,
-          "latency": 4.0166,
-          "tokens_per_second": 127.47
+          "latency": 3.9963,
+          "tokens_per_second": 128.12
         },
         {
           "idx": 18,
           "input_tokens": 2065,
           "output_tokens": 512,
-          "latency": 2.9999,
-          "tokens_per_second": 170.67
+          "latency": 2.9949,
+          "tokens_per_second": 170.96
         },
         {
           "idx": 19,
           "input_tokens": 588,
           "output_tokens": 512,
-          "latency": 2.3074,
-          "tokens_per_second": 221.89
+          "latency": 2.3002,
+          "tokens_per_second": 222.58
         }
       ],
       "ngram_config": {
@@ -711,151 +711,151 @@
       "num_prompts": 20,
       "total_input_tokens": 19066,
       "total_output_tokens": 8868,
-      "total_time": 62.032,
-      "avg_latency": 3.1016,
-      "median_latency": 3.116,
-      "p90_latency": 4.6996,
-      "output_tokens_per_second": 142.96,
+      "total_time": 61.678,
+      "avg_latency": 3.0839,
+      "median_latency": 3.0829,
+      "p90_latency": 4.6875,
+      "output_tokens_per_second": 143.78,
       "per_request": [
         {
           "idx": 0,
           "input_tokens": 400,
           "output_tokens": 512,
-          "latency": 1.2237,
-          "tokens_per_second": 418.41
+          "latency": 1.2239,
+          "tokens_per_second": 418.32
         },
         {
           "idx": 1,
           "input_tokens": 608,
           "output_tokens": 512,
-          "latency": 2.5205,
-          "tokens_per_second": 203.14
+          "latency": 2.5043,
+          "tokens_per_second": 204.45
         },
         {
           "idx": 2,
           "input_tokens": 923,
           "output_tokens": 512,
-          "latency": 2.1399,
-          "tokens_per_second": 239.27
+          "latency": 2.1259,
+          "tokens_per_second": 240.84
         },
         {
           "idx": 3,
           "input_tokens": 2268,
           "output_tokens": 512,
-          "latency": 4.6996,
-          "tokens_per_second": 108.95
+          "latency": 4.6875,
+          "tokens_per_second": 109.23
         },
         {
           "idx": 4,
           "input_tokens": 289,
           "output_tokens": 512,
-          "latency": 1.9937,
-          "tokens_per_second": 256.8
+          "latency": 1.9862,
+          "tokens_per_second": 257.77
         },
         {
           "idx": 5,
           "input_tokens": 690,
           "output_tokens": 512,
-          "latency": 2.1311,
-          "tokens_per_second": 240.25
+          "latency": 2.1182,
+          "tokens_per_second": 241.71
         },
         {
           "idx": 6,
           "input_tokens": 1426,
           "output_tokens": 512,
-          "latency": 4.232,
-          "tokens_per_second": 120.98
+          "latency": 4.191,
+          "tokens_per_second": 122.17
         },
         {
           "idx": 7,
           "input_tokens": 1645,
           "output_tokens": 115,
-          "latency": 1.21,
-          "tokens_per_second": 95.04
+          "latency": 1.1981,
+          "tokens_per_second": 95.98
         },
         {
           "idx": 8,
           "input_tokens": 963,
           "output_tokens": 512,
-          "latency": 4.1849,
-          "tokens_per_second": 122.34
+          "latency": 4.1845,
+          "tokens_per_second": 122.36
         },
         {
           "idx": 9,
           "input_tokens": 1942,
           "output_tokens": 512,
-          "latency": 6.2463,
-          "tokens_per_second": 81.97
+          "latency": 6.2078,
+          "tokens_per_second": 82.48
         },
         {
           "idx": 10,
           "input_tokens": 417,
           "output_tokens": 512,
-          "latency": 4.4751,
-          "tokens_per_second": 114.41
+          "latency": 4.4326,
+          "tokens_per_second": 115.51
         },
         {
           "idx": 11,
           "input_tokens": 243,
           "output_tokens": 512,
-          "latency": 3.1541,
-          "tokens_per_second": 162.33
+          "latency": 3.2136,
+          "tokens_per_second": 159.32
         },
         {
           "idx": 12,
           "input_tokens": 239,
           "output_tokens": 219,
-          "latency": 2.0566,
-          "tokens_per_second": 106.49
+          "latency": 2.0602,
+          "tokens_per_second": 106.3
         },
         {
           "idx": 13,
           "input_tokens": 418,
           "output_tokens": 512,
-          "latency": 4.275,
-          "tokens_per_second": 119.77
+          "latency": 4.2421,
+          "tokens_per_second": 120.69
         },
         {
           "idx": 14,
           "input_tokens": 419,
           "output_tokens": 179,
-          "latency": 1.7767,
-          "tokens_per_second": 100.75
+          "latency": 1.7641,
+          "tokens_per_second": 101.47
         },
         {
           "idx": 15,
           "input_tokens": 1602,
           "output_tokens": 473,
-          "latency": 3.9966,
-          "tokens_per_second": 118.35
+          "latency": 3.9556,
+          "tokens_per_second": 119.58
         },
         {
           "idx": 16,
           "input_tokens": 735,
           "output_tokens": 202,
-          "latency": 1.8441,
-          "tokens_per_second": 109.54
+          "latency": 1.8249,
+          "tokens_per_second": 110.69
         },
         {
           "idx": 17,
           "input_tokens": 1186,
           "output_tokens": 512,
-          "latency": 4.1965,
-          "tokens_per_second": 122.01
+          "latency": 4.1303,
+          "tokens_per_second": 123.96
         },
         {
           "idx": 18,
           "input_tokens": 2065,
           "output_tokens": 512,
-          "latency": 3.116,
-          "tokens_per_second": 164.32
+          "latency": 3.0829,
+          "tokens_per_second": 166.08
         },
         {
           "idx": 19,
           "input_tokens": 588,
           "output_tokens": 512,
-          "latency": 2.5598,
-          "tokens_per_second": 200.02
+          "latency": 2.5444,
+          "tokens_per_second": 201.23
         }
       ],
       "ngram_config": {
@@ -985,151 +985,151 @@
       "num_prompts": 20,
       "total_input_tokens": 19066,
       "total_output_tokens": 8769,
-      "total_time": 56.113,
-      "avg_latency": 2.8057,
-      "median_latency": 2.7146,
-      "p90_latency": 4.464,
-      "output_tokens_per_second": 156.27,
+      "total_time": 56.224,
+      "avg_latency": 2.8112,
+      "median_latency": 2.7141,
+      "p90_latency": 4.4872,
+      "output_tokens_per_second": 155.96,
       "per_request": [
         {
           "idx": 0,
           "input_tokens": 400,
           "output_tokens": 512,
-          "latency": 1.1942,
-          "tokens_per_second": 428.74
+          "latency": 1.1887,
+          "tokens_per_second": 430.71
         },
         {
           "idx": 1,
           "input_tokens": 608,
           "output_tokens": 512,
-          "latency": 2.7146,
-          "tokens_per_second": 188.61
+          "latency": 2.7141,
+          "tokens_per_second": 188.64
         },
         {
           "idx": 2,
           "input_tokens": 923,
           "output_tokens": 512,
-          "latency": 2.2443,
-          "tokens_per_second": 228.13
+          "latency": 2.2429,
+          "tokens_per_second": 228.27
         },
         {
           "idx": 3,
           "input_tokens": 2268,
           "output_tokens": 512,
-          "latency": 4.8544,
-          "tokens_per_second": 105.47
+          "latency": 4.8525,
+          "tokens_per_second": 105.51
         },
         {
           "idx": 4,
           "input_tokens": 289,
           "output_tokens": 512,
-          "latency": 3.88,
-          "tokens_per_second": 131.96
+          "latency": 3.8835,
+          "tokens_per_second": 131.84
         },
         {
           "idx": 5,
           "input_tokens": 690,
           "output_tokens": 512,
-          "latency": 2.2841,
-          "tokens_per_second": 224.16
+          "latency": 2.2835,
+          "tokens_per_second": 224.21
         },
         {
           "idx": 6,
           "input_tokens": 1426,
           "output_tokens": 512,
-          "latency": 4.0181,
-          "tokens_per_second": 127.42
+          "latency": 4.0402,
+          "tokens_per_second": 126.73
         },
         {
           "idx": 7,
           "input_tokens": 1645,
           "output_tokens": 512,
-          "latency": 2.6092,
-          "tokens_per_second": 196.23
+          "latency": 2.621,
+          "tokens_per_second": 195.34
         },
         {
           "idx": 8,
           "input_tokens": 963,
           "output_tokens": 512,
-          "latency": 4.0154,
-          "tokens_per_second": 127.51
+          "latency": 4.0227,
+          "tokens_per_second": 127.28
         },
         {
           "idx": 9,
           "input_tokens": 1942,
           "output_tokens": 512,
-          "latency": 1.788,
-          "tokens_per_second": 286.36
+          "latency": 1.7986,
+          "tokens_per_second": 284.66
         },
         {
           "idx": 10,
           "input_tokens": 417,
           "output_tokens": 512,
-          "latency": 4.464,
-          "tokens_per_second": 114.7
+          "latency": 4.4872,
+          "tokens_per_second": 114.1
         },
         {
           "idx": 11,
           "input_tokens": 243,
           "output_tokens": 512,
-          "latency": 1.9015,
-          "tokens_per_second": 269.27
+          "latency": 1.9142,
+          "tokens_per_second": 267.47
         },
         {
           "idx": 12,
           "input_tokens": 239,
           "output_tokens": 512,
-          "latency": 2.9311,
-          "tokens_per_second": 174.68
+          "latency": 2.9549,
+          "tokens_per_second": 173.27
         },
         {
           "idx": 13,
           "input_tokens": 418,
           "output_tokens": 230,
-          "latency": 1.616,
-          "tokens_per_second": 142.33
+          "latency": 1.5963,
+          "tokens_per_second": 144.09
         },
         {
           "idx": 14,
           "input_tokens": 419,
           "output_tokens": 166,
-          "latency": 1.9754,
-          "tokens_per_second": 84.03
+          "latency": 1.9397,
+          "tokens_per_second": 85.58
         },
         {
           "idx": 15,
           "input_tokens": 1602,
           "output_tokens": 352,
-          "latency": 3.2491,
-          "tokens_per_second": 108.34
+          "latency": 3.2522,
+          "tokens_per_second": 108.23
         },
         {
           "idx": 16,
           "input_tokens": 735,
           "output_tokens": 202,
-          "latency": 1.9811,
-          "tokens_per_second": 101.96
+          "latency": 2.0103,
+          "tokens_per_second": 100.48
         },
         {
           "idx": 17,
           "input_tokens": 1186,
           "output_tokens": 512,
-          "latency": 4.4106,
-          "tokens_per_second": 116.08
+          "latency": 4.4127,
+          "tokens_per_second": 116.03
         },
         {
           "idx": 18,
           "input_tokens": 2065,
           "output_tokens": 139,
-          "latency": 1.2482,
-          "tokens_per_second": 111.36
+          "latency": 1.2582,
+          "tokens_per_second": 110.47
         },
         {
           "idx": 19,
           "input_tokens": 588,
           "output_tokens": 512,
-          "latency": 2.7339,
-          "tokens_per_second": 187.28
+          "latency": 2.7504,
+          "tokens_per_second": 186.15
         }
       ],
       "ngram_config": {
@@ -1259,151 +1259,151 @@
       "num_prompts": 20,
       "total_input_tokens": 19066,
       "total_output_tokens": 8665,
-      "total_time": 62.17,
-      "avg_latency": 3.1085,
-      "median_latency": 3.0178,
-      "p90_latency": 4.9197,
-      "output_tokens_per_second": 139.38,
+      "total_time": 62.163,
+      "avg_latency": 3.1081,
+      "median_latency": 2.9895,
+      "p90_latency": 4.8865,
+      "output_tokens_per_second": 139.39,
       "per_request": [
         {
           "idx": 0,
           "input_tokens": 400,
           "output_tokens": 512,
-          "latency": 2.3889,
-          "tokens_per_second": 214.32
+          "latency": 2.4045,
+          "tokens_per_second": 212.94
         },
         {
           "idx": 1,
           "input_tokens": 608,
           "output_tokens": 512,
-          "latency": 2.8971,
-          "tokens_per_second": 176.73
+          "latency": 2.9328,
+          "tokens_per_second": 174.58
         },
         {
           "idx": 2,
           "input_tokens": 923,
           "output_tokens": 512,
-          "latency": 2.3207,
-          "tokens_per_second": 220.62
+          "latency": 2.3264,
+          "tokens_per_second": 220.08
         },
         {
           "idx": 3,
           "input_tokens": 2268,
           "output_tokens": 512,
-          "latency": 4.9197,
-          "tokens_per_second": 104.07
+          "latency": 4.9569,
+          "tokens_per_second": 103.29
         },
         {
           "idx": 4,
           "input_tokens": 289,
           "output_tokens": 512,
-          "latency": 2.0401,
-          "tokens_per_second": 250.96
+          "latency": 2.0568,
+          "tokens_per_second": 248.93
         },
         {
           "idx": 5,
           "input_tokens": 690,
           "output_tokens": 512,
-          "latency": 2.6025,
-          "tokens_per_second": 196.73
+          "latency": 2.6113,
+          "tokens_per_second": 196.07
         },
         {
           "idx": 6,
           "input_tokens": 1426,
           "output_tokens": 512,
-          "latency": 4.1007,
-          "tokens_per_second": 124.86
+          "latency": 4.0776,
+          "tokens_per_second": 125.56
         },
         {
           "idx": 7,
           "input_tokens": 1645,
           "output_tokens": 115,
-          "latency": 1.4381,
-          "tokens_per_second": 79.97
+          "latency": 1.4433,
+          "tokens_per_second": 79.68
         },
         {
           "idx": 8,
           "input_tokens": 963,
           "output_tokens": 512,
-          "latency": 4.8275,
-          "tokens_per_second": 106.06
+          "latency": 4.8438,
+          "tokens_per_second": 105.7
         },
         {
           "idx": 9,
           "input_tokens": 1942,
           "output_tokens": 512,
-          "latency": 1.9036,
-          "tokens_per_second": 268.97
+          "latency": 1.9201,
+          "tokens_per_second": 266.66
         },
         {
           "idx": 10,
           "input_tokens": 417,
           "output_tokens": 512,
-          "latency": 4.8228,
-          "tokens_per_second": 106.16
+          "latency": 4.8593,
+          "tokens_per_second": 105.36
         },
         {
           "idx": 11,
           "input_tokens": 243,
           "output_tokens": 512,
-          "latency": 3.275,
-          "tokens_per_second": 156.34
+          "latency": 3.2764,
+          "tokens_per_second": 156.27
         },
         {
           "idx": 12,
           "input_tokens": 239,
           "output_tokens": 512,
-          "latency": 3.1163,
-          "tokens_per_second": 164.3
+          "latency": 3.1421,
+          "tokens_per_second": 162.95
         },
         {
           "idx": 13,
           "input_tokens": 418,
           "output_tokens": 512,
-          "latency": 4.554,
-          "tokens_per_second": 112.43
+          "latency": 4.511,
+          "tokens_per_second": 113.5
         },
         {
           "idx": 14,
           "input_tokens": 419,
           "output_tokens": 177,
-          "latency": 2.0962,
-          "tokens_per_second": 84.44
+          "latency": 2.083,
+          "tokens_per_second": 84.97
         },
         {
           "idx": 15,
           "input_tokens": 1602,
           "output_tokens": 352,
-          "latency": 3.4712,
-          "tokens_per_second": 101.4
+          "latency": 3.4391,
+          "tokens_per_second": 102.35
         },
         {
           "idx": 16,
           "input_tokens": 735,
           "output_tokens": 202,
-          "latency": 2.0945,
-          "tokens_per_second": 96.44
+          "latency": 2.0718,
+          "tokens_per_second": 97.5
         },
         {
           "idx": 17,
           "input_tokens": 1186,
           "output_tokens": 512,
-          "latency": 4.941,
-          "tokens_per_second": 103.62
+          "latency": 4.8865,
+          "tokens_per_second": 104.78
         },
         {
           "idx": 18,
           "input_tokens": 2065,
           "output_tokens": 139,
-          "latency": 1.3414,
-          "tokens_per_second": 103.62
+          "latency": 1.3304,
+          "tokens_per_second": 104.48
         },
         {
           "idx": 19,
           "input_tokens": 588,
           "output_tokens": 512,
-          "latency": 3.0178,
-          "tokens_per_second": 169.66
+          "latency": 2.9895,
+          "tokens_per_second": 171.26
         }
       ],
       "ngram_config": {
