@@ -29,6 +29,9 @@ _USE_HASH_ENV = "VLLM_NGRAM_USE_HASH"
 #   VLLM_NGRAM_USE_TRIE="0"  -> disabled (default)
 # ---------------------------------------------------------------------------
 _USE_TRIE_ENV = "VLLM_NGRAM_USE_TRIE"
+_USE_TRIE_FUZZY_ENV = "VLLM_TRIE_FUZZY"
+_USE_SKIPGRAM_ENV = "VLLM_NGRAM_USE_SKIPGRAM"
+_SKIPGRAM_SENTINEL = -999
 
 # Persistence flush threshold: flush ngramTable every N update steps
 _FLUSH_EVERY = 100
@@ -156,14 +159,58 @@ class TrieTree:
 
         return token_id, nodes
 
+    def _match_fuzzy(self, token_ids: list[int], mode: str = 'mix',
+                     idx: int = 0, wild_budget: int = 1) -> tuple:
+        """Fuzzy _match: allow up to wild_budget token mismatches.
+        Returns (last_token, children) of the deepest-reaching path."""
+        if len(token_ids) == 0:
+            return None, self.nodes
+
+        best_depth = [0]
+        best_children = [{}]
+
+        def _check_freq(node):
+            if mode == 'input':
+                return node.freqs.get(idx, 0.0) > 0
+            elif mode == 'output':
+                return node.freqs.get(-1, 0.0) > 0
+            return (node.freqs.get(idx, 0.0) > 0
+                    or node.freqs.get(-1, 0.0) > 0)
+
+        def _dfs(nodes, pos, budget, depth):
+            if pos >= len(token_ids):
+                if depth > best_depth[0]:
+                    best_depth[0] = depth
+                    best_children[0] = nodes
+                return
+            if not nodes:
+                return
+            key, width = self._make_key(token_ids, pos)
+            for child_key, child_node in nodes.items():
+                is_exact = (child_key == key)
+                if not is_exact and budget <= 0:
+                    continue
+                if not _check_freq(child_node):
+                    continue
+                new_budget = budget if is_exact else budget - 1
+                _dfs(child_node.children, pos + width, new_budget,
+                     depth + 1)
+
+        _dfs(self.nodes, 0, wild_budget, 0)
+        last_token = token_ids[-1] if token_ids else None
+        return last_token, best_children[0]
+
     def get(self, token_ids: list[int], max_size: int = 64,
             max_length: int = 8, min_input_size: int = 0,
             min_output_size: int = 0, output_weight: float = 0.5,
-            mode: str = 'mix', idx: int = 0):
+            mode: str = 'mix', idx: int = 0, wild_budget: int = 0):
         """Multi-branch query — faithful reproduction of Tree.get."""
         assert mode in ('input', 'output', 'mix')
 
         match_token_id, nodes = self._match(token_ids, mode=mode, idx=idx)
+        if len(nodes) == 0 and wild_budget > 0:
+            match_token_id, nodes = self._match_fuzzy(
+                token_ids, mode=mode, idx=idx, wild_budget=wild_budget)
         if len(nodes) == 0:
             token_id = token_ids[-1] if len(token_ids) > 0 \
                 else self.token_id
@@ -328,12 +375,16 @@ class TrieTree:
                             idx=idx)
 
     def get_one_branch(self, token_ids: list[int], max_length: int = 8,
-                       mode: str = 'mix', idx: int = 0):
+                       mode: str = 'mix', idx: int = 0,
+                       wild_budget: int = 0):
         """Single-branch query — faithful reproduction of
         Tree.get_one_branch."""
         assert mode in ('input', 'output', 'mix')
 
         match_token_id, nodes = self._match(token_ids, mode=mode, idx=idx)
+        if len(nodes) == 0 and wild_budget > 0:
+            match_token_id, nodes = self._match_fuzzy(
+                token_ids, mode=mode, idx=idx, wild_budget=wild_budget)
         if len(nodes) == 0:
             token_id = token_ids[-1] if len(token_ids) > 0 \
                 else self.token_id
@@ -516,7 +567,7 @@ class TrieCache:
     def hier_get(self, token_ids: list[int], decoding_length: int = 64,
                  branch_length: int = 8, min_input_size: int = 0,
                  min_output_size: int = 0, mode: str = 'mix',
-                 idx: int = 0):
+                 idx: int = 0, wild_budget: int = 0):
         """Multi-branch sliding-window query — faithful reproduction of
         LookaheadCache.hier_get."""
         default_mask = np.ones((1, 1), dtype=np.int64)
@@ -541,7 +592,8 @@ class TrieCache:
                     min_input_size=min_input_size,
                     min_output_size=min_output_size,
                     mode=mode,
-                    idx=idx)
+                    idx=idx,
+                    wild_budget=wild_budget)
                 s = len(decoding_ids)
                 if s >= branch_length:
                     break
@@ -554,7 +606,7 @@ class TrieCache:
     def one_get(self, token_ids: list[int], decoding_length: int = 64,
                 branch_length: int = 8, min_input_size: int = 0,
                 min_output_size: int = 0, mode: str = 'mix',
-                idx: int = 0):
+                idx: int = 0, wild_budget: int = 0):
         """Single-branch sliding-window query — faithful reproduction of
         LookaheadCache.one_get."""
         default_mask = np.ones((1, 1), dtype=np.int64)
@@ -577,7 +629,8 @@ class TrieCache:
                         ids,
                         max_length=branch_length,
                         mode=mode,
-                        idx=idx)
+                        idx=idx,
+                        wild_budget=wild_budget)
                 s = len(decoding_ids)
                 if s >= branch_length // 2:
                     break
@@ -589,7 +642,8 @@ class TrieCache:
 
     def get(self, token_ids: list[int], branch_length: int = 8,
             decoding_length: int = 64, min_output_size: int = 0,
-            mode: str = 'output', idx: int = 0) -> list[int]:
+            mode: str = 'output', idx: int = 0,
+            wild_budget: int = 0) -> list[int]:
         """vLLM adapter: calls hier_get (faithful to original), then
         extracts the greedy best single branch from the multi-branch
         tree result.
@@ -604,7 +658,8 @@ class TrieCache:
             branch_length=branch_length,
             min_output_size=min_output_size,
             mode=mode,
-            idx=idx)
+            idx=idx,
+            wild_budget=wild_budget)
 
         if len(decoding_ids) <= 1:
             return []
@@ -695,6 +750,8 @@ class NgramProposer:
         # Minimum confidence threshold for drafting
         self._min_confidence: float = float(os.environ.get(
             "VLLM_NGRAM_MIN_CONFIDENCE", "0.3"))
+        # Skip-gram frequency table (context with 1 gap -> Counter)
+        self._skipgram_table: dict[tuple, Counter] = {}
         # Update counter for periodic persistence
         self._update_count: int = 0
         # Lock for async persistence
@@ -719,6 +776,8 @@ class NgramProposer:
         self._trie_cache: Optional[TrieCache] = None
         self._trie_req_last_num_tokens: dict[int, int] = {}
         self._trie_persist_lock = threading.Lock()
+        self._trie_fuzzy_budget: int = int(os.environ.get(
+            _USE_TRIE_FUZZY_ENV, "0"))
 
         if os.environ.get(_USE_TRIE_ENV, "0") == "1":
             self._trie_init()
@@ -1052,9 +1111,13 @@ class NgramProposer:
     ) -> list[list[int]]:
         use_trie = os.environ.get(_USE_TRIE_ENV, "0") == "1"
         use_hash = os.environ.get(_USE_HASH_ENV, "1") == "1"
+        use_skipgram = os.environ.get(_USE_SKIPGRAM_ENV, "0") == "1"
 
         if use_trie:
             return self._propose_trie_mode(
+                sampled_token_ids, num_tokens_no_spec, token_ids_cpu)
+        elif use_skipgram:
+            return self._propose_skipgram_mode(
                 sampled_token_ids, num_tokens_no_spec, token_ids_cpu)
         elif use_hash:
             return self._propose_hash_mode(
@@ -1099,6 +1162,158 @@ class NgramProposer:
                 if context not in local:
                     local[context] = Counter()
                 local[context][next_token] += 1
+
+    # ------------------------------------------------------------------
+    # Private: skip-gram hash table build & update & propose
+    # ------------------------------------------------------------------
+
+    def _build_skipgram_from_tokens(self, token_ids: list[int]) -> None:
+        """Build skip-gram frequency table from full token sequence."""
+        for n in range(self.min_n, self.max_n + 1):
+            for i in range(len(token_ids) - n):
+                context = token_ids[i:i + n]
+                next_token = token_ids[i + n]
+                for skip_pos in range(n):
+                    pattern = list(context)
+                    pattern[skip_pos] = _SKIPGRAM_SENTINEL
+                    key = tuple(pattern)
+                    if key not in self._skipgram_table:
+                        self._skipgram_table[key] = Counter()
+                    self._skipgram_table[key][next_token] += 1
+
+    def _update_skipgram_table(self, token_ids: list[int],
+                               n_new: int) -> None:
+        """Incremental update of skip-gram table."""
+        total = len(token_ids)
+        for n in range(self.min_n, self.max_n + 1):
+            start = max(0, total - n_new - n)
+            for i in range(start, total - n):
+                context = token_ids[i:i + n]
+                next_token = token_ids[i + n]
+                for skip_pos in range(n):
+                    pattern = list(context)
+                    pattern[skip_pos] = _SKIPGRAM_SENTINEL
+                    key = tuple(pattern)
+                    if key not in self._skipgram_table:
+                        self._skipgram_table[key] = Counter()
+                    self._skipgram_table[key][next_token] += 1
+
+    def _propose_tokens_skipgram(
+        self,
+        input_ids: list[int],
+        k: int,
+        req_idx: int = 0,
+    ) -> list[int]:
+        """Draft tokens: exact hash lookup first, skip-gram fallback."""
+        drafts: list[int] = []
+        n = min(self.max_n, len(input_ids))
+        if n < self.min_n:
+            return drafts
+
+        extended = list(input_ids)
+        min_conf = self._min_confidence
+
+        for step in range(k):
+            best_token = None
+            best_confidence = 0.0
+
+            # 1. Exact match (same as hash mode)
+            for try_n in range(n, self.min_n - 1, -1):
+                if try_n > len(extended):
+                    continue
+                context = tuple(extended[-try_n:])
+                counter = self._get_merged_counter(context, req_idx)
+                if counter:
+                    token, conf = self._check_confidence(counter)
+                    if token is not None and conf > best_confidence:
+                        best_token = token
+                        best_confidence = conf
+                        if conf >= min_conf:
+                            break
+
+            # 2. Skip-gram fallback (when exact fails or low confidence)
+            if best_token is None or best_confidence < min_conf:
+                for try_n in range(n, self.min_n - 1, -1):
+                    if try_n > len(extended):
+                        continue
+                    context = list(extended[-try_n:])
+                    for skip_pos in range(try_n):
+                        pattern = list(context)
+                        pattern[skip_pos] = _SKIPGRAM_SENTINEL
+                        key = tuple(pattern)
+                        counter = self._skipgram_table.get(key)
+                        if counter:
+                            token, conf = self._check_confidence(counter)
+                            # Discount skip-gram confidence
+                            conf *= 0.7
+                            if token is not None and conf > best_confidence:
+                                best_token = token
+                                best_confidence = conf
+                    if best_confidence >= min_conf:
+                        break
+
+            if best_token is None:
+                break
+            if best_confidence < min_conf * 0.5:
+                break
+
+            drafts.append(best_token)
+            extended.append(best_token)
+
+        return drafts
+
+    def _propose_skipgram_mode(
+        self,
+        sampled_token_ids: list[list[int]],
+        num_tokens_no_spec: np.ndarray,
+        token_ids_cpu: np.ndarray,
+    ) -> list[list[int]]:
+        """Skip-gram hash mode: exact hash + skip-gram fallback."""
+        draft_token_ids: list[list[int]] = []
+
+        for i, sampled_ids in enumerate(sampled_token_ids):
+            if not len(sampled_ids):
+                draft_token_ids.append([])
+                continue
+
+            num_tokens = int(num_tokens_no_spec[i])
+            if num_tokens >= self.max_model_len:
+                draft_token_ids.append([])
+                continue
+
+            tokens = token_ids_cpu[i, :num_tokens].tolist()
+
+            # Detect new request vs continuation
+            prev_len = self._req_last_num_tokens.get(i)
+            if prev_len is None or num_tokens < prev_len:
+                self._req_local_freq[i] = {}
+                if not self._freq_table:
+                    self._build_tables_from_tokens(tokens)
+                else:
+                    self._update_freq_table(tokens, num_tokens)
+                self._update_local_freq_table(tokens, num_tokens, i)
+                if not self._skipgram_table:
+                    self._build_skipgram_from_tokens(tokens)
+                else:
+                    self._update_skipgram_table(tokens, num_tokens)
+            else:
+                n_new = num_tokens - prev_len
+                if n_new > 0:
+                    self._update_freq_table(tokens, n_new)
+                    self._update_local_freq_table(tokens, n_new, i)
+                    self._update_skipgram_table(tokens, n_new)
+
+            self._req_last_num_tokens[i] = num_tokens
+
+            k = min(self.k, self.max_model_len - num_tokens)
+            if k <= 0:
+                draft_token_ids.append([])
+                continue
+
+            drafts = self._propose_tokens_skipgram(tokens, k, req_idx=i)
+            draft_token_ids.append(drafts)
+
+        return draft_token_ids
 
     def _propose_hash_mode(
         self,
@@ -1266,7 +1481,8 @@ class NgramProposer:
                 context, branch_length=bl,
                 decoding_length=dl,
                 min_output_size=min_output_size,
-                mode='mix', idx=i)
+                mode='mix', idx=i,
+                wild_budget=self._trie_fuzzy_budget)
             # Truncate to at most k drafts
             draft_token_ids.append(drafts[:k])
 

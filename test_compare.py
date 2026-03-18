@@ -65,13 +65,18 @@ class BenchResult:
 
 def _run(prompt_texts, model_name, gpu_mem, max_tokens,
          spec_config, mode_name, num_warmup, result_queue,
-         use_hash=False, use_trie=False, trie_node_size=1):
+         use_hash=False, use_trie=False, trie_node_size=1,
+         extra_env=None):
     import torch as _torch
 
     os.environ["VLLM_NGRAM_USE_HASH"] = "1" if use_hash else "0"
     os.environ["VLLM_NGRAM_USE_TRIE"] = "1" if use_trie else "0"
     os.environ["VLLM_TRIE_NODE_SIZE"] = str(trie_node_size)
     os.environ["VLLM_TRIE_INTERNAL_NODE_SIZE"] = "1"
+    # Apply extra env vars (for fuzzy, skipgram, etc.)
+    if extra_env:
+        for k, v in extra_env.items():
+            os.environ[k] = str(v)
 
     from vllm import LLM, SamplingParams
     from vllm.v1.metrics.reader import Counter as MCounter
@@ -202,14 +207,15 @@ def _run(prompt_texts, model_name, gpu_mem, max_tokens,
 
 def run_subprocess(prompt_texts, model_name, gpu_mem, max_tokens,
                    spec_config, mode_name, num_warmup=2,
-                   use_hash=False, use_trie=False, trie_node_size=1):
+                   use_hash=False, use_trie=False, trie_node_size=1,
+                   extra_env=None):
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
     p = ctx.Process(
         target=_run,
         args=(prompt_texts, model_name, gpu_mem, max_tokens,
               spec_config, mode_name, num_warmup, q,
-              use_hash, use_trie, trie_node_size),
+              use_hash, use_trie, trie_node_size, extra_env),
     )
     p.start()
     p.join(timeout=1200)
@@ -248,28 +254,32 @@ def main():
         "prompt_lookup_min": 2,
     }
 
-    # (name, spec_config, use_hash, use_trie, trie_node_size)
+    # (name, spec_config, use_hash, use_trie, trie_node_size, extra_env)
     configs = [
-        ("baseline",       None,        False, False, 1),
-        ("Hash",           ngram_spec,  True,  False, 1),
-        ("Trie-2g root",   ngram_spec,  False, True,  2),
-        ("Trie-3g root",   ngram_spec,  False, True,  3),
-        ("Suffix",         suffix_spec, False, False, 1),
+        ("baseline",       None,        False, False, 1, None),
+        ("Hash",           ngram_spec,  True,  False, 1, None),
+        ("Trie-3g root",   ngram_spec,  False, True,  3, None),
+        ("Trie-3g+Fuzzy",  ngram_spec,  False, True,  3,
+         {"VLLM_TRIE_FUZZY": "1"}),
+        ("SkipGram",       ngram_spec,  False, False, 1,
+         {"VLLM_NGRAM_USE_SKIPGRAM": "1", "VLLM_NGRAM_USE_HASH": "0"}),
+        ("Suffix",         suffix_spec, False, False, 1, None),
     ]
 
-    for i, (name, sc, uh, ut, ns) in enumerate(configs):
+    for i, (name, sc, uh, ut, ns, ee) in enumerate(configs):
         print(f"\n>>> [{i+1}/{len(configs)}] {name} ...")
         r = run_subprocess(
             prompt_texts, args.model, args.gpu_mem, args.max_tokens,
             spec_config=sc, mode_name=name,
             use_hash=uh, use_trie=ut, trie_node_size=ns,
+            extra_env=ee,
         )
         all_results.append(r)
         time.sleep(2)
 
     # Summary
     print("\n\n" + "=" * 120)
-    print("COMPARISON: Trie root-only vs Hash vs Suffix  (spec=5)")
+    print("COMPARISON: Trie/Fuzzy/SkipGram vs Hash vs Suffix  (spec=5)")
     print("=" * 120)
 
     valid = [r for r in all_results if "error" not in r]
