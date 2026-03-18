@@ -31,6 +31,7 @@ _USE_HASH_ENV = "VLLM_NGRAM_USE_HASH"
 _USE_TRIE_ENV = "VLLM_NGRAM_USE_TRIE"
 _USE_TRIE_FUZZY_ENV = "VLLM_TRIE_FUZZY"
 _USE_SKIPGRAM_ENV = "VLLM_NGRAM_USE_SKIPGRAM"
+_USE_TRIE_SKIPGRAM_ENV = "VLLM_TRIE_SKIPGRAM"
 _SKIPGRAM_SENTINEL = -999
 
 # Persistence flush threshold: flush ngramTable every N update steps
@@ -72,11 +73,20 @@ class TrieTree:
     # ---- write path ----
 
     def put(self, token_ids: list[int], mode: str = 'output', idx: int = 0,
-            freq: float = 1.0):
+            freq: float = 1.0, skip_gram: bool = False):
         assert mode in ('input', 'output')
         if mode == 'output':
             idx = -1
         self._put(token_ids, self.nodes, mode=mode, idx=idx, freq=freq)
+        # Insert skip-gram variants: for each position, replace that token
+        # with sentinel and insert the variant sequence.  The sentinel node
+        # aggregates frequencies across different tokens at that position.
+        if skip_gram and len(token_ids) > 1:
+            for skip_pos in range(len(token_ids)):
+                variant = list(token_ids)
+                variant[skip_pos] = _SKIPGRAM_SENTINEL
+                self._put(variant, self.nodes, mode=mode, idx=idx,
+                          freq=freq)
 
     def _make_key(self, token_ids: list[int], pos: int) -> tuple:
         """Make a node key from pos.  Returns (key, advance_count).
@@ -128,9 +138,10 @@ class TrieTree:
     # ---- read path ----
 
     def _match(self, token_ids: list[int], mode: str = 'mix',
-               idx: int = 0) -> tuple:
+               idx: int = 0, skip_gram: bool = False) -> tuple:
         """Walk token_ids through the tree.  Returns (last_token, children).
         last_token is the last individual token of the deepest matched chunk.
+        When skip_gram=True, if exact child not found, try sentinel child.
         """
         nodes = self.nodes
         token_id = None
@@ -141,6 +152,9 @@ class TrieTree:
         while pos < len(token_ids):
             key, width = self._make_key(token_ids, pos)
             node = nodes.get(key, None)
+            # Skip-gram fallback: try sentinel child
+            if node is None and skip_gram:
+                node = nodes.get(_SKIPGRAM_SENTINEL, None)
             nodes = {}
             if node is None:
                 token_id = token_ids[pos + width - 1]
@@ -203,11 +217,15 @@ class TrieTree:
     def get(self, token_ids: list[int], max_size: int = 64,
             max_length: int = 8, min_input_size: int = 0,
             min_output_size: int = 0, output_weight: float = 0.5,
-            mode: str = 'mix', idx: int = 0, wild_budget: int = 0):
+            mode: str = 'mix', idx: int = 0, wild_budget: int = 0,
+            skip_gram: bool = False):
         """Multi-branch query — faithful reproduction of Tree.get."""
         assert mode in ('input', 'output', 'mix')
 
         match_token_id, nodes = self._match(token_ids, mode=mode, idx=idx)
+        if len(nodes) == 0 and skip_gram:
+            match_token_id, nodes = self._match(
+                token_ids, mode=mode, idx=idx, skip_gram=True)
         if len(nodes) == 0 and wild_budget > 0:
             match_token_id, nodes = self._match_fuzzy(
                 token_ids, mode=mode, idx=idx, wild_budget=wild_budget)
@@ -376,12 +394,15 @@ class TrieTree:
 
     def get_one_branch(self, token_ids: list[int], max_length: int = 8,
                        mode: str = 'mix', idx: int = 0,
-                       wild_budget: int = 0):
+                       wild_budget: int = 0, skip_gram: bool = False):
         """Single-branch query — faithful reproduction of
         Tree.get_one_branch."""
         assert mode in ('input', 'output', 'mix')
 
         match_token_id, nodes = self._match(token_ids, mode=mode, idx=idx)
+        if len(nodes) == 0 and skip_gram:
+            match_token_id, nodes = self._match(
+                token_ids, mode=mode, idx=idx, skip_gram=True)
         if len(nodes) == 0 and wild_budget > 0:
             match_token_id, nodes = self._match_fuzzy(
                 token_ids, mode=mode, idx=idx, wild_budget=wild_budget)
@@ -495,14 +516,46 @@ class TrieCache:
     """
 
     def __init__(self, max_node: int = 65536, max_output_node: int = 512,
-                 node_size: int = 1):
+                 node_size: int = 1, skip_gram: bool = False):
         self.max_node = max_node
         self.max_output_node = max_output_node
         self.node_size = node_size
+        self.skip_gram = skip_gram  # insert/lookup skip-variant root keys
         self.mem: dict = {}  # key: int (node_size=1) or tuple
         self._output_ids: defaultdict[int, list] = defaultdict(list)
         self._update_trees: set[TrieTree] = set()
         self._update_input_trees: set[TrieTree] = set()
+
+    # ---- skip-gram root key helpers ----
+
+    def _skip_root_variants(self, root_key) -> list[tuple]:
+        """Generate skip-gram variant root keys (replace one position with
+        sentinel). Only for node_size > 1."""
+        if not self.skip_gram or self.node_size <= 1:
+            return []
+        rk = root_key if isinstance(root_key, tuple) else (root_key,)
+        variants = []
+        for skip_pos in range(len(rk)):
+            v = list(rk)
+            v[skip_pos] = _SKIPGRAM_SENTINEL
+            variants.append(tuple(v))
+        return variants
+
+    def _put_to_tree(self, root_key, tup: list[int], mode: str, idx: int,
+                     tid: int):
+        """Insert tup into the TrieTree for root_key, creating if needed."""
+        tree = self.mem.get(root_key, None)
+        if tree is not None:
+            tree.put(tup, mode=mode, idx=idx, skip_gram=self.skip_gram)
+            self._update_trees.add(tree)
+        else:
+            tree = TrieTree(tid, max_node=self.max_node,
+                            max_output_node=self.max_output_node)
+            tree.put(tup, mode=mode, idx=idx, skip_gram=self.skip_gram)
+            self.mem[root_key] = tree
+        if mode == 'input':
+            self._update_input_trees.add(tree)
+        return tree
 
     # ---- bulk write (prompt / input) ----
 
@@ -515,19 +568,12 @@ class TrieCache:
         for i in range(ts - ns + 1):
             root_key = token_ids[i] if ns == 1 else tuple(token_ids[i:i + ns])
             tup = token_ids[i + ns:i + ns + branch_length]
-            tree = self.mem.get(root_key, None)
-            if tree is not None:
-                tree.put(tup, mode=mode, idx=idx)
-                self._update_trees.add(tree)
-            else:
-                # token_id = last token of root n-gram (anchor for ids[0])
-                tid = root_key if ns == 1 else root_key[-1]
-                tree = TrieTree(tid, max_node=self.max_node,
-                                max_output_node=self.max_output_node)
-                tree.put(tup, mode=mode, idx=idx)
-                self.mem[root_key] = tree
-            if mode == 'input':
-                self._update_input_trees.add(tree)
+            # token_id = last token of root n-gram (anchor for ids[0])
+            tid = root_key if ns == 1 else root_key[-1]
+            self._put_to_tree(root_key, tup, mode, idx, tid)
+            # Insert skip-gram root variants
+            for skip_key in self._skip_root_variants(root_key):
+                self._put_to_tree(skip_key, tup, mode, idx, tid)
 
     # ---- streaming write (generated output) ----
 
@@ -545,16 +591,11 @@ class TrieCache:
                 root_key = output_ids[i] if ns == 1 \
                     else tuple(output_ids[i:i + ns])
                 tup = output_ids[i + ns:i + ns + branch_length]
-                tree = self.mem.get(root_key, None)
-                if tree is not None:
-                    tree.put(tup, mode='output', idx=idx)
-                else:
-                    tid = root_key if ns == 1 else root_key[-1]
-                    tree = TrieTree(tid, max_node=self.max_node,
-                                    max_output_node=self.max_output_node)
-                    tree.put(tup, mode='output', idx=idx)
-                    self.mem[root_key] = tree
-                self._update_trees.add(tree)
+                tid = root_key if ns == 1 else root_key[-1]
+                self._put_to_tree(root_key, tup, 'output', idx, tid)
+                # Insert skip-gram root variants
+                for skip_key in self._skip_root_variants(root_key):
+                    self._put_to_tree(skip_key, tup, 'output', idx, tid)
             if not final:
                 self._output_ids[idx] = output_ids[ts - branch_length:]
         if final:
@@ -583,6 +624,12 @@ class TrieCache:
             root_key = token_ids[i] if ns == 1 \
                 else tuple(token_ids[i:i + ns])
             tree = self.mem.get(root_key, None)
+            # Skip-gram fallback: try skip-variant root keys
+            if tree is None and self.skip_gram and ns > 1:
+                for skip_key in self._skip_root_variants(root_key):
+                    tree = self.mem.get(skip_key, None)
+                    if tree is not None:
+                        break
             if tree is not None:
                 ids = token_ids[i + ns:]
                 decoding_ids, decoding_masks, sizes = tree.get(
@@ -593,7 +640,8 @@ class TrieCache:
                     min_output_size=min_output_size,
                     mode=mode,
                     idx=idx,
-                    wild_budget=wild_budget)
+                    wild_budget=wild_budget,
+                    skip_gram=self.skip_gram)
                 s = len(decoding_ids)
                 if s >= branch_length:
                     break
@@ -622,6 +670,12 @@ class TrieCache:
             root_key = token_ids[i] if ns == 1 \
                 else tuple(token_ids[i:i + ns])
             tree = self.mem.get(root_key, None)
+            # Skip-gram fallback: try skip-variant root keys
+            if tree is None and self.skip_gram and ns > 1:
+                for skip_key in self._skip_root_variants(root_key):
+                    tree = self.mem.get(skip_key, None)
+                    if tree is not None:
+                        break
             if tree is not None:
                 ids = token_ids[i + ns:]
                 decoding_ids, decoding_masks, sizes = \
@@ -630,7 +684,8 @@ class TrieCache:
                         max_length=branch_length,
                         mode=mode,
                         idx=idx,
-                        wild_budget=wild_budget)
+                        wild_budget=wild_budget,
+                        skip_gram=self.skip_gram)
                 s = len(decoding_ids)
                 if s >= branch_length // 2:
                     break
@@ -778,6 +833,8 @@ class NgramProposer:
         self._trie_persist_lock = threading.Lock()
         self._trie_fuzzy_budget: int = int(os.environ.get(
             _USE_TRIE_FUZZY_ENV, "0"))
+        self._trie_skipgram: bool = os.environ.get(
+            _USE_TRIE_SKIPGRAM_ENV, "0") == "1"
 
         if os.environ.get(_USE_TRIE_ENV, "0") == "1":
             self._trie_init()
@@ -1375,13 +1432,14 @@ class NgramProposer:
     def _trie_init(self) -> None:
         """Initialize TrieCache, loading from disk if available."""
         ns = self._trie_node_size
+        sg = self._trie_skipgram
         if self.trie_table_path and os.path.exists(self.trie_table_path):
             try:
                 with open(self.trie_table_path, "rb") as f:
                     mem = pickle.load(f)
                 self._trie_cache = TrieCache(
                     max_node=65536, max_output_node=512,
-                    node_size=ns)
+                    node_size=ns, skip_gram=sg)
                 self._trie_cache.mem = mem
                 logger.info(
                     "Loaded trieTable from %s: %d root entries",
@@ -1393,9 +1451,10 @@ class NgramProposer:
                     self.trie_table_path, exc_info=True)
         self._trie_cache = TrieCache(
             max_node=65536, max_output_node=512,
-            node_size=ns)
+            node_size=ns, skip_gram=sg)
         if ns > 1:
-            logger.info("Trie root_node_size=%d", ns)
+            logger.info("Trie root_node_size=%d%s", ns,
+                        " +skipgram" if sg else "")
 
     def _trie_persist_sync(self) -> None:
         """Synchronously persist TrieCache.mem to disk."""

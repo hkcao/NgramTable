@@ -261,6 +261,8 @@ def main():
         ("Trie-3g root",   ngram_spec,  False, True,  3, None),
         ("Trie-3g+Fuzzy",  ngram_spec,  False, True,  3,
          {"VLLM_TRIE_FUZZY": "1"}),
+        ("Trie+Skip",      ngram_spec,  False, True,  1,
+         {"VLLM_TRIE_SKIPGRAM": "1"}),
         ("SkipGram",       ngram_spec,  False, False, 1,
          {"VLLM_NGRAM_USE_SKIPGRAM": "1", "VLLM_NGRAM_USE_HASH": "0"}),
         ("Suffix",         suffix_spec, False, False, 1, None),
