@@ -33,9 +33,76 @@ _USE_TRIE_FUZZY_ENV = "VLLM_TRIE_FUZZY"
 _USE_SKIPGRAM_ENV = "VLLM_NGRAM_USE_SKIPGRAM"
 _USE_TRIE_SKIPGRAM_ENV = "VLLM_TRIE_SKIPGRAM"
 _SKIPGRAM_SENTINEL = -999
+_USE_TRIE_EDITDIST_ENV = "VLLM_TRIE_EDIT_DIST"
+_USE_TRIE_EDITDIST_BUILD_ENV = "VLLM_TRIE_EDIT_DIST_BUILD"
+_MAX_EDIT_VARIANTS = 3  # max similar tokens per position during build
 
 # Persistence flush threshold: flush ngramTable every N update steps
 _FLUSH_EVERY = 100
+
+
+# ======================================================================
+# Edit distance utilities (BK-tree for token-string fuzzy matching)
+# ======================================================================
+
+def _edit_distance(s1: str, s2: str) -> int:
+    """Levenshtein edit distance between two strings."""
+    m, n = len(s1), len(s2)
+    if m < n:
+        s1, s2 = s2, s1
+        m, n = n, m
+    if n == 0:
+        return m
+    prev = list(range(n + 1))
+    for i in range(m):
+        curr = [i + 1]
+        for j in range(n):
+            curr.append(min(
+                prev[j + 1] + 1,
+                curr[j] + 1,
+                prev[j] + (0 if s1[i] == s2[j] else 1)
+            ))
+        prev = curr
+    return prev[n]
+
+
+class BKTree:
+    """BK-tree for efficient nearest-neighbor search by edit distance."""
+
+    def __init__(self):
+        self.root = None
+
+    def insert(self, word: str, token_id: int):
+        if self.root is None:
+            self.root = (word, token_id, {})
+            return
+        current = self.root
+        while True:
+            d = _edit_distance(current[0], word)
+            if d == 0:
+                return
+            if d in current[2]:
+                current = current[2][d]
+            else:
+                current[2][d] = (word, token_id, {})
+                return
+
+    def search(self, word: str, max_dist: int) -> list[tuple[int, int]]:
+        """Find all tokens within max_dist.
+        Returns [(token_id, dist), ...], excluding exact matches (d=0)."""
+        if self.root is None:
+            return []
+        results = []
+        stack = [self.root]
+        while stack:
+            node = stack.pop()
+            d = _edit_distance(node[0], word)
+            if 0 < d <= max_dist:
+                results.append((node[1], d))
+            for dist, child in node[2].items():
+                if d - max_dist <= dist <= d + max_dist:
+                    stack.append(child)
+        return results
 
 
 # ======================================================================
@@ -214,11 +281,64 @@ class TrieTree:
         last_token = token_ids[-1] if token_ids else None
         return last_token, best_children[0]
 
+    def _match_editdist(self, token_ids: list[int], mode: str = 'mix',
+                        idx: int = 0, id2str: dict | None = None,
+                        max_dist: int = 1) -> tuple:
+        """Walk token_ids through tree with edit distance fallback.
+        When exact match fails, try the child with smallest edit distance
+        (within max_dist) to the query token string."""
+        nodes = self.nodes
+        token_id = None
+        if len(token_ids) == 0:
+            return token_id, nodes
+
+        pos = 0
+        while pos < len(token_ids):
+            key, width = self._make_key(token_ids, pos)
+            node = nodes.get(key, None)
+            # Edit distance fallback: find closest child
+            if node is None and id2str:
+                query_str = id2str.get(key, '')
+                if query_str:
+                    best_node = None
+                    best_dist = max_dist + 1
+                    for child_key, child_node in nodes.items():
+                        if child_key == _SKIPGRAM_SENTINEL:
+                            continue
+                        if isinstance(child_key, tuple):
+                            continue
+                        child_str = id2str.get(child_key, '')
+                        if child_str:
+                            d = _edit_distance(query_str, child_str)
+                            if d <= max_dist and d < best_dist:
+                                best_dist = d
+                                best_node = child_node
+                    node = best_node
+            nodes = {}
+            if node is None:
+                token_id = token_ids[pos + width - 1]
+                break
+            token_id = token_ids[pos + width - 1]
+            if mode == 'input':
+                if node.freqs.get(idx, 0.0) > 0:
+                    nodes = node.children
+            elif mode == 'output':
+                if node.freqs.get(-1, 0.0) > 0:
+                    nodes = node.children
+            else:
+                if node.freqs.get(idx, 0.0) > 0 \
+                        or node.freqs.get(-1, 0.0) > 0:
+                    nodes = node.children
+            pos += width
+
+        return token_id, nodes
+
     def get(self, token_ids: list[int], max_size: int = 64,
             max_length: int = 8, min_input_size: int = 0,
             min_output_size: int = 0, output_weight: float = 0.5,
             mode: str = 'mix', idx: int = 0, wild_budget: int = 0,
-            skip_gram: bool = False):
+            skip_gram: bool = False, edit_dist: int = 0,
+            id2str: dict | None = None):
         """Multi-branch query — faithful reproduction of Tree.get."""
         assert mode in ('input', 'output', 'mix')
 
@@ -226,6 +346,10 @@ class TrieTree:
         if len(nodes) == 0 and skip_gram:
             match_token_id, nodes = self._match(
                 token_ids, mode=mode, idx=idx, skip_gram=True)
+        if len(nodes) == 0 and edit_dist > 0 and id2str is not None:
+            match_token_id, nodes = self._match_editdist(
+                token_ids, mode=mode, idx=idx,
+                id2str=id2str, max_dist=edit_dist)
         if len(nodes) == 0 and wild_budget > 0:
             match_token_id, nodes = self._match_fuzzy(
                 token_ids, mode=mode, idx=idx, wild_budget=wild_budget)
@@ -394,7 +518,9 @@ class TrieTree:
 
     def get_one_branch(self, token_ids: list[int], max_length: int = 8,
                        mode: str = 'mix', idx: int = 0,
-                       wild_budget: int = 0, skip_gram: bool = False):
+                       wild_budget: int = 0, skip_gram: bool = False,
+                       edit_dist: int = 0,
+                       id2str: dict | None = None):
         """Single-branch query — faithful reproduction of
         Tree.get_one_branch."""
         assert mode in ('input', 'output', 'mix')
@@ -403,6 +529,10 @@ class TrieTree:
         if len(nodes) == 0 and skip_gram:
             match_token_id, nodes = self._match(
                 token_ids, mode=mode, idx=idx, skip_gram=True)
+        if len(nodes) == 0 and edit_dist > 0 and id2str is not None:
+            match_token_id, nodes = self._match_editdist(
+                token_ids, mode=mode, idx=idx,
+                id2str=id2str, max_dist=edit_dist)
         if len(nodes) == 0 and wild_budget > 0:
             match_token_id, nodes = self._match_fuzzy(
                 token_ids, mode=mode, idx=idx, wild_budget=wild_budget)
@@ -516,11 +646,19 @@ class TrieCache:
     """
 
     def __init__(self, max_node: int = 65536, max_output_node: int = 512,
-                 node_size: int = 1, skip_gram: bool = False):
+                 node_size: int = 1, skip_gram: bool = False,
+                 edit_dist: int = 0, edit_dist_build: bool = False,
+                 id2str: dict | None = None,
+                 bk_tree: BKTree | None = None):
         self.max_node = max_node
         self.max_output_node = max_output_node
         self.node_size = node_size
         self.skip_gram = skip_gram  # insert/lookup skip-variant root keys
+        self.edit_dist = edit_dist  # edit distance threshold (0=disabled)
+        self.edit_dist_build = edit_dist_build  # insert variants during build
+        self.id2str = id2str or {}  # token_id -> token string
+        self.bk_tree = bk_tree  # BK-tree for similar token search
+        self._similar_cache: dict[int, list[int]] = {}  # lazy cache
         self.mem: dict = {}  # key: int (node_size=1) or tuple
         self._output_ids: defaultdict[int, list] = defaultdict(list)
         self._update_trees: set[TrieTree] = set()
@@ -541,17 +679,51 @@ class TrieCache:
             variants.append(tuple(v))
         return variants
 
+    # ---- edit-distance helpers ----
+
+    def _get_similar(self, token_id: int) -> list[int]:
+        """Get similar token IDs by edit distance, with lazy caching."""
+        if token_id in self._similar_cache:
+            return self._similar_cache[token_id]
+        if not self.bk_tree or token_id not in self.id2str:
+            self._similar_cache[token_id] = []
+            return []
+        word = self.id2str[token_id]
+        results = self.bk_tree.search(word, self.edit_dist)
+        results.sort(key=lambda x: x[1])  # sort by distance
+        similar = [r[0] for r in results[:_MAX_EDIT_VARIANTS]]
+        self._similar_cache[token_id] = similar
+        return similar
+
+    def _edit_root_variants(self, root_key) -> list:
+        """Generate edit-distance variant root keys."""
+        if self.edit_dist <= 0 or not self.bk_tree:
+            return []
+        if self.node_size == 1:
+            return self._get_similar(root_key)
+        # For node_size > 1: replace one position at a time
+        rk = root_key if isinstance(root_key, tuple) else (root_key,)
+        variants = []
+        for pos in range(len(rk)):
+            for sim_id in self._get_similar(rk[pos]):
+                v = list(rk)
+                v[pos] = sim_id
+                variants.append(tuple(v))
+        return variants[:_MAX_EDIT_VARIANTS * self.node_size]
+
     def _put_to_tree(self, root_key, tup: list[int], mode: str, idx: int,
-                     tid: int):
+                     tid: int, freq: float = 1.0,
+                     skip_gram: bool | None = None):
         """Insert tup into the TrieTree for root_key, creating if needed."""
+        sg = self.skip_gram if skip_gram is None else skip_gram
         tree = self.mem.get(root_key, None)
         if tree is not None:
-            tree.put(tup, mode=mode, idx=idx, skip_gram=self.skip_gram)
+            tree.put(tup, mode=mode, idx=idx, freq=freq, skip_gram=sg)
             self._update_trees.add(tree)
         else:
             tree = TrieTree(tid, max_node=self.max_node,
                             max_output_node=self.max_output_node)
-            tree.put(tup, mode=mode, idx=idx, skip_gram=self.skip_gram)
+            tree.put(tup, mode=mode, idx=idx, freq=freq, skip_gram=sg)
             self.mem[root_key] = tree
         if mode == 'input':
             self._update_input_trees.add(tree)
@@ -574,6 +746,24 @@ class TrieCache:
             # Insert skip-gram root variants
             for skip_key in self._skip_root_variants(root_key):
                 self._put_to_tree(skip_key, tup, mode, idx, tid)
+            # Insert edit-distance variants (only if build mode enabled)
+            if self.edit_dist_build:
+                # Root variants
+                for ed_key in self._edit_root_variants(root_key):
+                    ed_tid = ed_key if ns == 1 else ed_key[-1]
+                    self._put_to_tree(ed_key, tup, mode, idx, ed_tid,
+                                      freq=0.5, skip_gram=False)
+                # Internal variants
+                if len(tup) > 0:
+                    tree = self.mem.get(root_key)
+                    if tree:
+                        for pos in range(len(tup)):
+                            for sim_id in self._get_similar(
+                                    tup[pos])[:_MAX_EDIT_VARIANTS]:
+                                variant = list(tup)
+                                variant[pos] = sim_id
+                                tree.put(variant, mode=mode, idx=idx,
+                                         freq=0.5, skip_gram=False)
 
     # ---- streaming write (generated output) ----
 
@@ -596,6 +786,23 @@ class TrieCache:
                 # Insert skip-gram root variants
                 for skip_key in self._skip_root_variants(root_key):
                     self._put_to_tree(skip_key, tup, 'output', idx, tid)
+                # Insert edit-distance variants (only if build mode enabled)
+                if self.edit_dist_build:
+                    for ed_key in self._edit_root_variants(root_key):
+                        ed_tid = ed_key if ns == 1 else ed_key[-1]
+                        self._put_to_tree(ed_key, tup, 'output', idx,
+                                          ed_tid, freq=0.5, skip_gram=False)
+                    if len(tup) > 0:
+                        tree = self.mem.get(root_key)
+                        if tree:
+                            for pos in range(len(tup)):
+                                for sim_id in self._get_similar(
+                                        tup[pos])[:_MAX_EDIT_VARIANTS]:
+                                    variant = list(tup)
+                                    variant[pos] = sim_id
+                                    tree.put(variant, mode='output',
+                                             idx=idx, freq=0.5,
+                                             skip_gram=False)
             if not final:
                 self._output_ids[idx] = output_ids[ts - branch_length:]
         if final:
@@ -620,6 +827,7 @@ class TrieCache:
         decoding_ids = None
         decoding_masks = default_mask
         sizes = [0, 0]
+        # First pass: exact match only (original behavior)
         for i in range(len(token_ids) - ns + 1):
             root_key = token_ids[i] if ns == 1 \
                 else tuple(token_ids[i:i + ns])
@@ -646,6 +854,39 @@ class TrieCache:
                 if s >= branch_length:
                     break
 
+        # Second pass: edit-distance fallback (only if exact match failed)
+        if (decoding_ids is None or len(decoding_ids) <= 1) \
+                and self.edit_dist > 0:
+            for i in range(len(token_ids) - ns + 1):
+                root_key = token_ids[i] if ns == 1 \
+                    else tuple(token_ids[i:i + ns])
+                # Try similar root keys
+                tree = None
+                for ed_key in self._edit_root_variants(root_key):
+                    tree = self.mem.get(ed_key, None)
+                    if tree is not None:
+                        break
+                # Also try exact root with internal edit-dist matching
+                if tree is None:
+                    tree = self.mem.get(root_key, None)
+                if tree is not None:
+                    ids = token_ids[i + ns:]
+                    decoding_ids, decoding_masks, sizes = tree.get(
+                        ids,
+                        max_size=decoding_length,
+                        max_length=branch_length,
+                        min_input_size=min_input_size,
+                        min_output_size=min_output_size,
+                        mode=mode,
+                        idx=idx,
+                        wild_budget=wild_budget,
+                        skip_gram=self.skip_gram,
+                        edit_dist=self.edit_dist,
+                        id2str=self.id2str)
+                    s = len(decoding_ids)
+                    if s >= branch_length:
+                        break
+
         if decoding_ids is None:
             decoding_ids = token_ids[-1:]
 
@@ -666,6 +907,7 @@ class TrieCache:
         decoding_ids = None
         decoding_masks = default_mask
         sizes = [0, 0]
+        # First pass: exact match only
         for i in range(len(token_ids) - ns + 1):
             root_key = token_ids[i] if ns == 1 \
                 else tuple(token_ids[i:i + ns])
@@ -689,6 +931,35 @@ class TrieCache:
                 s = len(decoding_ids)
                 if s >= branch_length // 2:
                     break
+
+        # Second pass: edit-distance fallback (only if exact match failed)
+        if (decoding_ids is None or len(decoding_ids) <= 1) \
+                and self.edit_dist > 0:
+            for i in range(len(token_ids) - ns + 1):
+                root_key = token_ids[i] if ns == 1 \
+                    else tuple(token_ids[i:i + ns])
+                tree = None
+                for ed_key in self._edit_root_variants(root_key):
+                    tree = self.mem.get(ed_key, None)
+                    if tree is not None:
+                        break
+                if tree is None:
+                    tree = self.mem.get(root_key, None)
+                if tree is not None:
+                    ids = token_ids[i + ns:]
+                    decoding_ids, decoding_masks, sizes = \
+                        tree.get_one_branch(
+                            ids,
+                            max_length=branch_length,
+                            mode=mode,
+                            idx=idx,
+                            wild_budget=wild_budget,
+                            skip_gram=self.skip_gram,
+                            edit_dist=self.edit_dist,
+                            id2str=self.id2str)
+                    s = len(decoding_ids)
+                    if s >= branch_length // 2:
+                        break
 
         if decoding_ids is None:
             decoding_ids = token_ids[-1:]
@@ -766,6 +1037,8 @@ class NgramProposer:
         self.k = vllm_config.speculative_config.num_speculative_tokens
         # Maximum length of the model.
         self.max_model_len = vllm_config.model_config.max_model_len
+        # Model name (for tokenizer loading in edit-distance mode).
+        self._model_name = vllm_config.model_config.model
 
         # Pre-allocate buffers for numba batch propose (KMP mode).
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
@@ -835,6 +1108,10 @@ class NgramProposer:
             _USE_TRIE_FUZZY_ENV, "0"))
         self._trie_skipgram: bool = os.environ.get(
             _USE_TRIE_SKIPGRAM_ENV, "0") == "1"
+        self._trie_edit_dist: int = int(os.environ.get(
+            _USE_TRIE_EDITDIST_ENV, "0"))
+        self._trie_edit_dist_build: bool = os.environ.get(
+            _USE_TRIE_EDITDIST_BUILD_ENV, "0") == "1"
 
         if os.environ.get(_USE_TRIE_ENV, "0") == "1":
             self._trie_init()
@@ -1433,13 +1710,20 @@ class NgramProposer:
         """Initialize TrieCache, loading from disk if available."""
         ns = self._trie_node_size
         sg = self._trie_skipgram
+        ed = self._trie_edit_dist
+        # Build BK-tree + id2str if edit distance is enabled
+        id2str, bk_tree = None, None
+        if ed > 0:
+            id2str, bk_tree = self._build_bk_tree()
         if self.trie_table_path and os.path.exists(self.trie_table_path):
             try:
                 with open(self.trie_table_path, "rb") as f:
                     mem = pickle.load(f)
                 self._trie_cache = TrieCache(
                     max_node=65536, max_output_node=512,
-                    node_size=ns, skip_gram=sg)
+                    node_size=ns, skip_gram=sg,
+                    edit_dist=ed, edit_dist_build=self._trie_edit_dist_build,
+                    id2str=id2str, bk_tree=bk_tree)
                 self._trie_cache.mem = mem
                 logger.info(
                     "Loaded trieTable from %s: %d root entries",
@@ -1451,10 +1735,15 @@ class NgramProposer:
                     self.trie_table_path, exc_info=True)
         self._trie_cache = TrieCache(
             max_node=65536, max_output_node=512,
-            node_size=ns, skip_gram=sg)
+            node_size=ns, skip_gram=sg,
+            edit_dist=ed, edit_dist_build=self._trie_edit_dist_build,
+                    id2str=id2str, bk_tree=bk_tree)
         if ns > 1:
             logger.info("Trie root_node_size=%d%s", ns,
                         " +skipgram" if sg else "")
+        if ed > 0:
+            logger.info("Trie edit_dist=%d (BK-tree with %d vocab entries)",
+                        ed, len(id2str) if id2str else 0)
 
     def _trie_persist_sync(self) -> None:
         """Synchronously persist TrieCache.mem to disk."""
@@ -1468,6 +1757,23 @@ class NgramProposer:
             logger.debug("Persisted trieTable to %s", self.trie_table_path)
         except Exception:
             logger.warning("Failed to persist trieTable", exc_info=True)
+
+    def _build_bk_tree(self) -> tuple[dict, BKTree]:
+        """Build BK-tree and id2str map from tokenizer vocabulary."""
+        import time as _time
+        from transformers import AutoTokenizer
+        t0 = _time.perf_counter()
+        tokenizer = AutoTokenizer.from_pretrained(
+            self._model_name, trust_remote_code=True)
+        vocab = tokenizer.get_vocab()  # {str: int}
+        id2str = {v: k for k, v in vocab.items()}
+        bk = BKTree()
+        for word, tid in vocab.items():
+            bk.insert(word, tid)
+        elapsed = _time.perf_counter() - t0
+        logger.info("Built BK-tree from %d vocab entries in %.1fs",
+                    len(vocab), elapsed)
+        return id2str, bk
 
     def _trie_persist_async(self) -> None:
         """Asynchronously persist trie in a background thread."""

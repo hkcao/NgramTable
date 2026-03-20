@@ -13,6 +13,32 @@ from typing import Optional
 from datasets import load_dataset
 
 
+def build_chat_prompts(num_samples: int = 20,
+                       max_prompt_len: int = 2048) -> list[str]:
+    """Build prompts from Alpaca (instruction-following / daily conversation)."""
+    print("Loading Alpaca (instruction-following) ...")
+    ds = load_dataset("tatsu-lab/alpaca", split="train")
+    print(f"Dataset size: {len(ds)}")
+    prompts: list[str] = []
+    for sample in ds:
+        if len(prompts) >= num_samples:
+            break
+        instruction = sample.get("instruction", "")
+        inp = sample.get("input", "")
+        if not instruction:
+            continue
+        text = instruction
+        if inp:
+            text += f"\n\n{inp}"
+        if len(text) < 20:
+            continue
+        if len(text) > max_prompt_len * 4:
+            text = text[:max_prompt_len * 4]
+        prompts.append(text)
+    print(f"Prepared {len(prompts)} prompts")
+    return prompts
+
+
 def build_swe_prompts(num_samples: int = 20,
                       max_prompt_len: int = 2048) -> list[str]:
     print("Loading SWE-bench Lite ...")
@@ -236,9 +262,16 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--max-prompt-len", type=int, default=2048)
     parser.add_argument("--gpu-mem", type=float, default=0.9)
+    parser.add_argument("--dataset", default="swe",
+                        choices=["swe", "chat"],
+                        help="Dataset: swe (code) or chat (Alpaca)")
     args = parser.parse_args()
 
-    prompt_texts = build_swe_prompts(args.num_samples, args.max_prompt_len)
+    if args.dataset == "chat":
+        prompt_texts = build_chat_prompts(args.num_samples,
+                                          args.max_prompt_len)
+    else:
+        prompt_texts = build_swe_prompts(args.num_samples, args.max_prompt_len)
     all_results = []
 
     ngram_spec = {
@@ -256,16 +289,15 @@ def main():
 
     # (name, spec_config, use_hash, use_trie, trie_node_size, extra_env)
     configs = [
-        ("baseline",       None,        False, False, 1, None),
-        ("Hash",           ngram_spec,  True,  False, 1, None),
-        ("Trie-3g root",   ngram_spec,  False, True,  3, None),
-        ("Trie-3g+Fuzzy",  ngram_spec,  False, True,  3,
-         {"VLLM_TRIE_FUZZY": "1"}),
-        ("Trie+Skip",      ngram_spec,  False, True,  1,
-         {"VLLM_TRIE_SKIPGRAM": "1"}),
-        ("SkipGram",       ngram_spec,  False, False, 1,
-         {"VLLM_NGRAM_USE_SKIPGRAM": "1", "VLLM_NGRAM_USE_HASH": "0"}),
-        ("Suffix",         suffix_spec, False, False, 1, None),
+        ("Trie",           ngram_spec,  False, True,  1, None),
+        ("Trie",           ngram_spec,  False, True,  1, None),
+        ("Trie",           ngram_spec,  False, True,  1, None),
+        ("Trie+ED(d=1)",   ngram_spec,  False, True,  1,
+         {"VLLM_TRIE_EDIT_DIST": "1"}),
+        ("Trie+ED(d=1)",   ngram_spec,  False, True,  1,
+         {"VLLM_TRIE_EDIT_DIST": "1"}),
+        ("Trie+ED(d=1)",   ngram_spec,  False, True,  1,
+         {"VLLM_TRIE_EDIT_DIST": "1"}),
     ]
 
     for i, (name, sc, uh, ut, ns, ee) in enumerate(configs):
@@ -281,7 +313,7 @@ def main():
 
     # Summary
     print("\n\n" + "=" * 120)
-    print("COMPARISON: Trie/Fuzzy/SkipGram vs Hash vs Suffix  (spec=5)")
+    print("COMPARISON: Trie + Edit Distance (BK-tree)  (spec=5)")
     print("=" * 120)
 
     valid = [r for r in all_results if "error" not in r]
