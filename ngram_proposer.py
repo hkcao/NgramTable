@@ -36,9 +36,33 @@ _SKIPGRAM_SENTINEL = -999
 _USE_TRIE_EDITDIST_ENV = "VLLM_TRIE_EDIT_DIST"
 _USE_TRIE_EDITDIST_BUILD_ENV = "VLLM_TRIE_EDIT_DIST_BUILD"
 _MAX_EDIT_VARIANTS = 3  # max similar tokens per position during build
+_USE_PYSUFFIX_ENV = "VLLM_NGRAM_USE_PYSUFFIX"
 
 # Persistence flush threshold: flush ngramTable every N update steps
 _FLUSH_EVERY = 100
+
+
+# ======================================================================
+# Python Suffix Tree — faithful reproduction of arctic_inference C++
+# ======================================================================
+# Full implementation in py_suffix_tree.py (compressed suffix tree with
+# path compression, count-ordered sibling lists, group-based reordering).
+import importlib as _importlib
+import pathlib as _pathlib
+
+def _import_py_suffix_tree():
+    """Import py_suffix_tree from the same directory as this file."""
+    _this_dir = _pathlib.Path(__file__).resolve().parent
+    _spec = _importlib.util.spec_from_file_location(
+        "py_suffix_tree", _this_dir / "py_suffix_tree.py")
+    _mod = _importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    return _mod
+
+_pst = _import_py_suffix_tree()
+PySuffixTree = _pst.PySuffixTree
+PySuffixDraft = _pst.PySuffixDraft
+PySuffixCache = _pst.PySuffixCache
 
 
 # ======================================================================
@@ -1119,6 +1143,25 @@ class NgramProposer:
             if self.trie_table_path:
                 atexit.register(self._trie_persist_sync)
 
+        # ---- PySuffix mode initialization ----
+        self._pysuffix_cache: Optional[PySuffixCache] = None
+        self._pysuffix_req_last_num_tokens: dict[int, int] = {}
+        self._pysuffix_min_prob: float = float(os.environ.get(
+            "VLLM_PYSUFFIX_MIN_PROB", "0.1"))
+        self._pysuffix_max_depth: int = int(os.environ.get(
+            "VLLM_PYSUFFIX_MAX_DEPTH", "64"))
+        self._pysuffix_max_spec_factor: float = float(os.environ.get(
+            "VLLM_PYSUFFIX_MAX_SPEC_FACTOR", "1.0"))
+
+        if os.environ.get(_USE_PYSUFFIX_ENV, "0") == "1":
+            self._pysuffix_cache = PySuffixCache(
+                max_depth=self._pysuffix_max_depth,
+                max_spec_factor=self._pysuffix_max_spec_factor)
+            logger.info("PySuffix mode enabled (max_depth=%d, min_prob=%.2f, "
+                        "max_spec_factor=%.1f)",
+                        self._pysuffix_max_depth, self._pysuffix_min_prob,
+                        self._pysuffix_max_spec_factor)
+
         # Trigger Numba JIT compilation for N-gram proposer (KMP warmup).
         self.propose(
             [[]] * 1024,
@@ -1442,12 +1485,18 @@ class NgramProposer:
         slot_mappings: dict[str, torch.Tensor]
         | list[dict[str, torch.Tensor]]
         | None = None,  # unused
+        input_batch=None,  # InputBatch, passed for PySuffix mode
     ) -> list[list[int]]:
         use_trie = os.environ.get(_USE_TRIE_ENV, "0") == "1"
         use_hash = os.environ.get(_USE_HASH_ENV, "1") == "1"
         use_skipgram = os.environ.get(_USE_SKIPGRAM_ENV, "0") == "1"
+        use_pysuffix = os.environ.get(_USE_PYSUFFIX_ENV, "0") == "1"
 
-        if use_trie:
+        if use_pysuffix:
+            return self._propose_pysuffix_mode(
+                sampled_token_ids, num_tokens_no_spec, token_ids_cpu,
+                input_batch=input_batch)
+        elif use_trie:
             return self._propose_trie_mode(
                 sampled_token_ids, num_tokens_no_spec, token_ids_cpu)
         elif use_skipgram:
@@ -1866,6 +1915,90 @@ class NgramProposer:
         self._trie_req_last_num_tokens.pop(idx, None)
         # Async persist
         self._trie_persist_async()
+
+    # ------------------------------------------------------------------
+    # Private: PySuffix mode — propose
+    # ------------------------------------------------------------------
+
+    def _propose_pysuffix_mode(
+        self,
+        sampled_token_ids: list[list[int]],
+        num_tokens_no_spec: np.ndarray,
+        token_ids_cpu: np.ndarray,
+        input_batch=None,
+    ) -> list[list[int]]:
+        """PySuffix mode: Python suffix tree, faithful to C++ SuffixDecoding.
+
+        Exactly mirrors SuffixDecodingProposer.propose() call sequence:
+        1. start_request(req_id, prompt_tokens) — prompt tokens only
+        2. add_tokens(req_id, sampled_ids) — each step's sampled tokens
+        3. speculate(req_id, pattern, ...) — with same params as C++
+        4. stop_request for requests not in current batch
+        """
+        if self._pysuffix_cache is None:
+            self._pysuffix_cache = PySuffixCache(
+                max_depth=self._pysuffix_max_depth,
+                max_spec_factor=self._pysuffix_max_spec_factor)
+
+        draft_token_ids: list[list[int]] = []
+
+        for i, sampled_ids in enumerate(sampled_token_ids):
+            if not sampled_ids:
+                draft_token_ids.append([])
+                continue
+
+            # Use req_id from input_batch (same as C++ Suffix)
+            if input_batch is not None:
+                req_id = input_batch.req_ids[i]
+            else:
+                req_id = i
+
+            num_tokens = int(num_tokens_no_spec[i])
+            if num_tokens >= self.max_model_len:
+                draft_token_ids.append([])
+                continue
+
+            # Start new request if not active (same as C++ Suffix)
+            if req_id not in self._pysuffix_cache.active_requests:
+                if req_id in self._pysuffix_cache.cached_requests:
+                    self._pysuffix_cache.evict_cached_response(req_id)
+                # Get exact prompt length from input_batch (same as C++)
+                if input_batch is not None:
+                    index = input_batch.req_id_to_index[req_id]
+                    num_prompt = int(input_batch.num_prompt_tokens[index])
+                    prompt_tokens = token_ids_cpu[index, :num_prompt]
+                else:
+                    num_prompt = num_tokens - len(sampled_ids)
+                    prompt_tokens = token_ids_cpu[i, :num_prompt]
+                self._pysuffix_cache.start_request(req_id, prompt_tokens)
+
+            # Add newly sampled tokens (same as add_active_response)
+            self._pysuffix_cache.add_tokens(req_id, sampled_ids)
+
+            # Query draft tokens — exact same formula as C++ Suffix
+            k = min(self.k, self.max_model_len - num_tokens - 1)
+            if k <= 0:
+                draft_token_ids.append([])
+                continue
+
+            # Context pattern: last max_depth tokens (same as C++)
+            max_depth = self._pysuffix_max_depth
+            start = max(0, num_tokens - max_depth)
+            pattern = token_ids_cpu[i, start:num_tokens]
+
+            drafts = self._pysuffix_cache.speculate(
+                req_id, pattern, max_tokens=k,
+                min_prob=self._pysuffix_min_prob)
+            draft_token_ids.append(drafts[:k])
+
+        # Stop requests not in current batch (same as C++ Suffix)
+        if input_batch is not None:
+            stale = (set(self._pysuffix_cache.active_requests)
+                     - input_batch.req_id_to_index.keys())
+            for req_id in stale:
+                self._pysuffix_cache.stop_request(req_id)
+
+        return draft_token_ids
 
     def load_model(self, *args, **kwargs):
         # No model to load.
