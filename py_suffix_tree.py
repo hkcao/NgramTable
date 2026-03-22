@@ -425,9 +425,11 @@ class PySuffixCache:
     API mirrors arctic_inference.suffix_decoding.SuffixDecodingCache.
     """
 
-    def __init__(self, max_depth: int = 64, max_spec_factor: float = 1.0):
+    def __init__(self, max_depth: int = 64, max_spec_factor: float = 1.0,
+                 max_cached_requests: int = -1):
         self.max_depth = max_depth
         self.max_spec_factor = max_spec_factor
+        self._max_cached_requests = max_cached_requests
         self._global_tree = PySuffixTree(max_depth)
         self._local_trees: dict = {}
         self._req_to_seq_id: dict = {}
@@ -444,9 +446,23 @@ class PySuffixCache:
     def start_request(self, req_id, prompt_token_ids):
         self._local_trees[req_id] = PySuffixTree(self.max_depth)
         self._local_trees[req_id].extend(0, prompt_token_ids)
-        seq_id = self._next_seq_id
-        self._next_seq_id += 1
-        self._req_to_seq_id[req_id] = seq_id
+        if self._max_cached_requests != 0:
+            if req_id in self._req_to_seq_id:
+                self.evict_cached_response(req_id)
+            seq_id = self._next_seq_id
+            self._next_seq_id = (self._next_seq_id + 1) & 0x7FFFFFFF
+            self._req_to_seq_id[req_id] = seq_id
+            self._maybe_evict(seq_id)
+
+    def _maybe_evict(self, new_seq_id: int):
+        """FIFO eviction when max_cached_requests is exceeded."""
+        if self._max_cached_requests < 0:
+            return
+        while len(self._req_to_seq_id) > self._max_cached_requests:
+            for rid, sid in self._req_to_seq_id.items():
+                if sid != new_seq_id:
+                    self.evict_cached_response(rid)
+                    break
 
     def add_tokens(self, req_id, token_ids):
         if req_id in self._local_trees:
@@ -469,6 +485,10 @@ class PySuffixCache:
         """Returns (token_ids, match_len)."""
         if max_spec_factor is None:
             max_spec_factor = self.max_spec_factor
+
+        # Truncate context to max_depth (same as C++ cache.py line 287-288)
+        if len(context) > self.max_depth:
+            context = context[-self.max_depth:]
 
         draft1 = PySuffixDraft()
         if req_id in self._local_trees:

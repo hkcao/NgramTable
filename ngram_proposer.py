@@ -1154,11 +1154,14 @@ class NgramProposer:
             "VLLM_PYSUFFIX_MAX_SPEC_FACTOR", "1.0"))
         self._pysuffix_min_match_len: int = int(os.environ.get(
             "VLLM_PYSUFFIX_MIN_MATCH_LEN", "0"))
+        self._pysuffix_max_cached_requests: int = int(os.environ.get(
+            "VLLM_PYSUFFIX_MAX_CACHED_REQUESTS", "-1"))
 
         if os.environ.get(_USE_PYSUFFIX_ENV, "0") == "1":
             self._pysuffix_cache = PySuffixCache(
                 max_depth=self._pysuffix_max_depth,
-                max_spec_factor=self._pysuffix_max_spec_factor)
+                max_spec_factor=self._pysuffix_max_spec_factor,
+                max_cached_requests=self._pysuffix_max_cached_requests)
             logger.info("PySuffix mode enabled (max_depth=%d, min_prob=%.2f, "
                         "max_spec_factor=%.1f, min_match_len=%d)",
                         self._pysuffix_max_depth, self._pysuffix_min_prob,
@@ -1941,7 +1944,8 @@ class NgramProposer:
         if self._pysuffix_cache is None:
             self._pysuffix_cache = PySuffixCache(
                 max_depth=self._pysuffix_max_depth,
-                max_spec_factor=self._pysuffix_max_spec_factor)
+                max_spec_factor=self._pysuffix_max_spec_factor,
+                max_cached_requests=self._pysuffix_max_cached_requests)
 
         draft_token_ids: list[list[int]] = []
 
