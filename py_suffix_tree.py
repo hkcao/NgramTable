@@ -465,7 +465,8 @@ class PySuffixCache:
 
     def speculate(self, req_id, context, max_tokens: int = 5,
                   min_prob: float = 0.1,
-                  max_spec_factor: float = None) -> list[int]:
+                  max_spec_factor: float = None) -> tuple[list[int], int]:
+        """Returns (token_ids, match_len)."""
         if max_spec_factor is None:
             max_spec_factor = self.max_spec_factor
 
@@ -478,4 +479,4 @@ class PySuffixCache:
             context, max_tokens, max_spec_factor, 0.0, min_prob, False)
 
         best = draft1 if draft1.score >= draft2.score else draft2
-        return best.token_ids
+        return best.token_ids, best.match_len

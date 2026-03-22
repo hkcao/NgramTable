@@ -220,7 +220,7 @@ def test_cache_dual_tree():
             context = prompt[start:start + ctx_len]
             for max_tok in [3, 5]:
                 for min_prob in [0.1, 0.3]:
-                    py_d = py_cache.speculate(
+                    py_d, _ = py_cache.speculate(
                         0, context, max_tokens=max_tok, min_prob=min_prob)
                     cpp_r = cpp_cache.speculate(
                         0, context, max_spec_tokens=max_tok,
@@ -266,7 +266,7 @@ def test_cache_dual_tree():
             context = all_tokens[start:start + ctx_len]
             for max_tok in [3, 5]:
                 for min_prob in [0.1, 0.3]:
-                    py_d = py_cache2.speculate(
+                    py_d, _ = py_cache2.speculate(
                         0, context, max_tokens=max_tok, min_prob=min_prob)
                     cpp_r = cpp_cache2.speculate(
                         0, context, max_spec_tokens=max_tok,
@@ -303,7 +303,7 @@ def test_cache_dual_tree():
     cpp_cache3.start_request(1, prompt1)
 
     ctx = [150, 160, 170]
-    py_d3 = py_cache3.speculate(1, ctx, max_tokens=5, min_prob=0.1)
+    py_d3, _ = py_cache3.speculate(1, ctx, max_tokens=5, min_prob=0.1)
     cpp_r3 = cpp_cache3.speculate(1, ctx, max_spec_tokens=5,
                                    max_spec_factor=1.0, max_spec_offset=0.0,
                                    min_token_prob=0.1)

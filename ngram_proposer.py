@@ -1152,15 +1152,18 @@ class NgramProposer:
             "VLLM_PYSUFFIX_MAX_DEPTH", "64"))
         self._pysuffix_max_spec_factor: float = float(os.environ.get(
             "VLLM_PYSUFFIX_MAX_SPEC_FACTOR", "1.0"))
+        self._pysuffix_min_match_len: int = int(os.environ.get(
+            "VLLM_PYSUFFIX_MIN_MATCH_LEN", "0"))
 
         if os.environ.get(_USE_PYSUFFIX_ENV, "0") == "1":
             self._pysuffix_cache = PySuffixCache(
                 max_depth=self._pysuffix_max_depth,
                 max_spec_factor=self._pysuffix_max_spec_factor)
             logger.info("PySuffix mode enabled (max_depth=%d, min_prob=%.2f, "
-                        "max_spec_factor=%.1f)",
+                        "max_spec_factor=%.1f, min_match_len=%d)",
                         self._pysuffix_max_depth, self._pysuffix_min_prob,
-                        self._pysuffix_max_spec_factor)
+                        self._pysuffix_max_spec_factor,
+                        self._pysuffix_min_match_len)
 
         # Trigger Numba JIT compilation for N-gram proposer (KMP warmup).
         self.propose(
@@ -1986,10 +1989,16 @@ class NgramProposer:
             start = max(0, num_tokens - max_depth)
             pattern = token_ids_cpu[i, start:num_tokens]
 
-            drafts = self._pysuffix_cache.speculate(
+            drafts, match_len = self._pysuffix_cache.speculate(
                 req_id, pattern, max_tokens=k,
                 min_prob=self._pysuffix_min_prob)
-            draft_token_ids.append(drafts[:k])
+
+            # Filter short matches (same as C++ min_match_len filter)
+            if (self._pysuffix_min_match_len > 0
+                    and match_len < self._pysuffix_min_match_len):
+                draft_token_ids.append([])
+            else:
+                draft_token_ids.append(drafts[:k])
 
         # Stop requests not in current batch (same as C++ Suffix)
         if input_batch is not None:
