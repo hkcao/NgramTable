@@ -451,6 +451,42 @@ match_len=3: pattern=[A, B, C]
 最终取 score 最高的 match_len。
 ```
 
+### 4.6 `min_match_len` 过滤（Proposer 层）
+
+`min_match_len` 不在 `SuffixTree.speculate` 内部实现，而是在上层 `SuffixDecodingProposer.propose()` 中作为**后置过滤**：
+
+```python
+# suffix_decoding.py (vLLM)
+draft = self.suffix_cache.speculate(req_id, pattern, ...)
+
+# 过滤：match_len 不够长的 draft 直接丢弃
+if self.min_match_len > 0 and draft.match_len < self.min_match_len:
+    draft_token_ids.append([])  # 不使用此 draft
+else:
+    draft_token_ids.append(draft.token_ids)
+```
+
+**参数**：
+- C++ Suffix：`VLLM_SUFFIX_MIN_MATCH_LEN`（默认 0）
+- PySuffix：`VLLM_PYSUFFIX_MIN_MATCH_LEN`（默认 0）
+
+**效果**：设置 `min_match_len=N` 后，只有当 context 末尾至少 N 个 token 在后缀树中有完整匹配时，才会返回 draft token。相当于要求更高的匹配置信度。
+
+**与 Trie 3-gram root 的关系**：Trie 的 `node_size=3`（3-gram root key）和 Suffix 的 `min_match_len=3` 本质等价 — 都要求至少匹配 3 个 token 才开始预测。但 Suffix 更灵活：不需要固定 root 大小，可以动态匹配任意长度后缀，`min_match_len` 只是一个过滤阈值。
+
+**Benchmark 结论**（SWE-bench Lite, spec=5）：
+
+| min_match_len | Speedup | Accept% | MeanLen | Drafts |
+|---|---|---|---|---|
+| 0（默认） | **2.02x** | 54.2% | 2.50 | 3480 |
+| 1 | 2.02x | 54.2% | 2.50 | 3480 |
+| 2 | 1.91x | 62.1% | 2.68 | 2894 |
+| 3 | 1.82x | 68.5% | 2.95 | 2315 |
+
+**结论**：`min_match_len > 0` 无收益。虽然 Accept% 随阈值提升（54% → 69%），但 draft 数量大幅减少（3480 → 2315），净效果为负。`min=0` 即为最优。
+
+原因：`min_match_len=0` 实际等价于 `min_match_len=1`（C++ speculate 的 match_len 总是 ≥ 1）。提高阈值过滤掉了大量"短匹配但正确"的 draft — 这些 draft 虽然 match_len 短，但 prob 可能很高（head_child 唯一），丢弃它们得不偿失。
+
 ---
 
 ## 五、删除流程 — `remove(seq_id)`
@@ -508,7 +544,15 @@ def remove(seq_id):
 
 C++ 原生 `float` 类型。在 GPU 推理框架中，float32 是标准精度，额外的 double 精度没有实际收益，反而浪费带宽。Python 复现时必须用 `struct.pack('f', x)` 匹配这一精度，否则在 `prob >= min_token_prob` 边界处会产生判断分歧。
 
-### 6.5 max_tree_depth=24 的意义
+### 6.5 为什么 min_match_len 默认为 0？
+
+直觉上，要求更长的匹配（min_match_len=2 或 3）应该提高预测质量。实测结果相反：
+
+- **Accept% 上升但 draft 数量暴跌**：min=3 时 accept 68.5%（+14%），但 drafts 从 3480 降到 2315（-33%）
+- **净效果为负**：speedup 从 2.02x 降到 1.82x
+- **根因**：短匹配（match_len=1）的 draft 虽然上下文信息少，但大多数情况下 head_child 唯一（prob=1.0），预测正确率并不低。丢弃它们 = 丢弃了大量"简单但正确"的预测
+
+### 6.6 max_tree_depth=24 的意义
 
 限制后缀树索引的最大深度（每个后缀最多追踪 24 个 token）。效果：
 - **内存控制**：避免为超长序列建立过深的后缀树
